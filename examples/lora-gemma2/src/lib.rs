@@ -34,6 +34,7 @@ pub mod batcher;
 pub mod dataset;
 pub mod loader;
 pub mod model;
+pub mod model_lora;
 pub mod tokenizer;
 pub mod types;
 
@@ -41,5 +42,9 @@ pub use batcher::{SFTBatch, SFTBatcher, SFTTrainingBatch};
 pub use dataset::{ChatItem, ChatMessageSerde, DatasetError, JsonlDataset};
 pub use loader::{LoadError, LoadReport};
 pub use model::{Gemma2Attention, Gemma2Block, Gemma2MLP, Gemma2Model};
+pub use model_lora::{
+    apply_lora_to_gemma2, count_lora_params, count_total_params, Gemma2AttentionLora,
+    Gemma2BlockLora, Gemma2ForSFT, Gemma2MLPLora, Gemma2ModelLora,
+};
 pub use tokenizer::{ChatMessage, GemmaTokenizer, Role, TokenizerError};
 pub use types::{Gemma2Config, LoraTarget};

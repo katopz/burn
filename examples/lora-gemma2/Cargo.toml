@@ -11,10 +11,10 @@ workspace = true
 
 [features]
 default = ["burn/tui"]
-ndarray = ["burn/ndarray"]
-ndarray-blas-accelerate = ["burn/ndarray", "burn/accelerate"]
-ndarray-blas-netlib = ["burn/ndarray", "burn/blas-netlib"]
-ndarray-blas-openblas = ["burn/ndarray", "burn/openblas"]
+ndarray = ["burn/ndarray", "dep:burn-ndarray"]
+ndarray-blas-accelerate = ["burn/ndarray", "burn/accelerate", "dep:burn-ndarray"]
+ndarray-blas-netlib = ["burn/ndarray", "burn/blas-netlib", "dep:burn-ndarray"]
+ndarray-blas-openblas = ["burn/ndarray", "burn/openblas", "dep:burn-ndarray"]
 tch-cpu = ["burn/tch"]
 tch-gpu = ["burn/tch"]
 wgpu = ["burn/wgpu"]
@@ -26,9 +26,14 @@ remote = ["burn/remote", "burn/default"]
 
 [dependencies]
 burn = { path = "../../crates/burn", features = ["train", "tui"] }
+burn-ndarray = { path = "../../crates/burn-ndarray", optional = true }
+burn-store = { path = "../../crates/burn-store", features = ["std", "safetensors"] }
 log = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true, features = ["std", "derive"] }
+serde_json = { workspace = true }
+env_logger = "0.11"
 
 [dev-dependencies]
 burn-ndarray = { path = "../../crates/burn-ndarray" }
+tempfile = { workspace = true }

@@ -30,8 +30,10 @@
 
 extern crate alloc;
 
+pub mod loader;
 pub mod model;
 pub mod types;
 
+pub use loader::{LoadError, LoadReport};
 pub use model::{Gemma2Attention, Gemma2Block, Gemma2MLP, Gemma2Model};
 pub use types::{Gemma2Config, LoraTarget};

@@ -114,7 +114,7 @@ impl std::str::FromStr for Role {
 }
 
 /// Error returned when a string cannot be parsed as a [`Role`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RoleParseError(String);
 
 impl fmt::Display for RoleParseError {

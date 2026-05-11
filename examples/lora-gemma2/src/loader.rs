@@ -10,12 +10,62 @@
 
 use std::path::{Path, PathBuf};
 
+use burn::tensor::DType;
 use burn::tensor::backend::Backend;
 use burn_store::{
-    KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore, SafetensorsStoreError,
+    KeyRemapper, ModuleAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
+    SafetensorsStoreError, TensorSnapshot,
 };
+use std::rc::Rc;
 
 use crate::model::Gemma2Model;
+
+// ---------------------------------------------------------------------------
+// BF16 → F32 Adapter
+// ---------------------------------------------------------------------------
+
+/// Adapter that converts BF16 tensors to F32 during loading.
+///
+/// HuggingFace Gemma 2 weights are stored in BF16, but backends like NdArray
+/// only support F32. Chain this adapter after `PyTorchToBurnAdapter` to
+/// transparently upcast weights during loading.
+///
+/// # Example
+///
+/// ```ignore
+/// let adapter = PyTorchToBurnAdapter.chain(Bf16ToF32Adapter);
+/// store.with_from_adapter(adapter);
+/// ```
+#[derive(Debug, Clone)]
+pub struct Bf16ToF32Adapter;
+
+impl ModuleAdapter for Bf16ToF32Adapter {
+    fn adapt(&self, snapshot: &TensorSnapshot) -> TensorSnapshot {
+        if snapshot.dtype != DType::BF16 {
+            return snapshot.clone();
+        }
+
+        let original_data_fn = snapshot.clone_data_fn();
+
+        let cast_data_fn = Rc::new(move || {
+            let data = original_data_fn()?;
+            Ok(data.convert_dtype(DType::F32))
+        });
+
+        TensorSnapshot::from_closure(
+            cast_data_fn,
+            DType::F32,
+            snapshot.shape.clone(),
+            snapshot.path_stack.clone().unwrap_or_default(),
+            snapshot.container_stack.clone().unwrap_or_default(),
+            snapshot.tensor_id.unwrap_or_default(),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ModuleAdapter> {
+        Box::new(self.clone())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Error & Report Types
@@ -352,9 +402,10 @@ pub fn load_gemma2_weights<B: Backend>(
 
         log::info!("Loading weights from: {file_name}");
 
+        let adapter = PyTorchToBurnAdapter.chain(Bf16ToF32Adapter);
         let mut store = SafetensorsStore::from_file(file_path)
             .remap(remapper.clone())
-            .with_from_adapter(PyTorchToBurnAdapter)
+            .with_from_adapter(adapter)
             .allow_partial(true);
 
         let result = model.load_from(&mut store).map_err(LoadError::Store)?;

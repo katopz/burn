@@ -1,3 +1,7 @@
+#![cfg_attr(
+    not(any(feature = "ndarray", feature = "wgpu", feature = "metal")),
+    allow(dead_code)
+)]
 //! Gemma 2 inference binary — demonstrates weight loading from HuggingFace safetensors.
 //!
 //! Usage:
@@ -147,7 +151,7 @@ fn main() {
 
 #[cfg(not(any(feature = "ndarray", feature = "wgpu", feature = "metal")))]
 fn main() {
-    compile_error!(
+    panic!(
         "Enable a backend feature:\n  \
          --features ndarray    (CPU, for testing)\n  \
          --features wgpu       (WGPU/Metal)\n  \

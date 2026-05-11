@@ -1,3 +1,7 @@
+#![cfg_attr(
+    not(any(feature = "ndarray", feature = "wgpu", feature = "metal")),
+    allow(dead_code)
+)]
 //! Binary to load real Gemma 4 E4B weights and verify forward pass.
 //!
 //! Usage:
@@ -322,7 +326,7 @@ fn main() {
 
 #[cfg(not(any(feature = "ndarray", feature = "wgpu", feature = "metal")))]
 fn main() {
-    compile_error!(
+    panic!(
         "Enable a backend feature:\n  \
          --features ndarray    (CPU, for testing)\n  \
          --features wgpu       (WGPU/Metal)\n  \

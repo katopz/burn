@@ -1,3 +1,7 @@
+#![cfg_attr(
+    not(any(feature = "ndarray", feature = "wgpu", feature = "metal")),
+    allow(dead_code)
+)]
 //! SFT (Supervised Fine-Tuning) training binary for LoRA-adapted Gemma 2.
 //!
 //! Fine-tunes a Gemma 2 model using LoRA on a JSONL dataset with
@@ -543,7 +547,7 @@ fn main() {
 
 #[cfg(not(any(feature = "ndarray", feature = "wgpu", feature = "metal")))]
 fn main() {
-    compile_error!(
+    panic!(
         "Enable a backend feature:\n  \
          --features ndarray    (CPU, for testing)\n  \
          --features wgpu       (WGPU/Metal)\n  \

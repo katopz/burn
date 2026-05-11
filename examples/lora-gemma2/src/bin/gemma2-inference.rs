@@ -1,8 +1,8 @@
 //! Gemma 2 inference binary — demonstrates weight loading from HuggingFace safetensors.
 //!
 //! Usage:
-//!   cargo run -p lora-gemma2 --bin gemma2-inference -- /path/to/model.safetensors
-//!   cargo run -p lora-gemma2 --bin gemma2-inference -- /path/to/model-directory/
+//!   cargo run -p lora-gemma2 --features ndarray --bin gemma2-inference -- /path/to/model.safetensors
+//!   cargo run -p lora-gemma2 --features ndarray --bin gemma2-inference -- /path/to/model-directory/
 //!
 //! This binary validates that weight loading works correctly by:
 //! 1. Loading weights from safetensors files
@@ -11,41 +11,13 @@
 
 use std::path::PathBuf;
 
+use burn::prelude::ElementConversion;
 use burn::tensor::{Int, Tensor};
 use lora_gemma2::loader::load_gemma2_weights;
 use lora_gemma2::{Gemma2Config, Gemma2Model, LoadReport};
 
-fn main() {
-    // Initialize logger
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-    let args: Vec<String> = std::env::args().collect();
-    let model_path = match args.get(1) {
-        Some(path) => PathBuf::from(path),
-        None => {
-            eprintln!("Usage: gemma2-inference <model-path>");
-            eprintln!();
-            eprintln!("Arguments:");
-            eprintln!("  <model-path>  Path to safetensors file, directory, or index JSON");
-            eprintln!();
-            eprintln!("Examples:");
-            eprintln!("  gemma2-inference model.safetensors");
-            eprintln!("  gemma2-inference /path/to/gemma-2-2b/");
-            eprintln!("  gemma2-inference model.safetensors.index.json");
-            std::process::exit(1);
-        }
-    };
-
-    // Use NdArray backend via burn's ndarray feature
-    // Run with: cargo run -p lora-gemma2 --features ndarray --bin gemma2-inference
-    #[cfg(not(feature = "ndarray"))]
-    compile_error!("Enable ndarray feature: cargo run --features ndarray --bin gemma2-inference");
-
-    type B = burn_ndarray::NdArray;
-
-    let device = Default::default();
-
-    // Build model with Gemma 2 2B config
+/// Run inference with a specific backend.
+fn run_inference<B: burn::tensor::backend::Backend>(model_path: PathBuf, device: B::Device) {
     let config = Gemma2Config::gemma2_2b();
     let mut model = Gemma2Model::<B>::new(&config, &device);
 
@@ -87,13 +59,35 @@ fn main() {
     log::info!("  Logit stats: min={min:.4}, max={max:.4}, mean={mean:.4}");
 
     // Verify output is not all zeros (indicates weights loaded correctly)
-    if min == 0.0 && max == 0.0 {
+    let min_val: f64 = min.elem();
+    let max_val: f64 = max.elem();
+    if min_val == 0.0 && max_val == 0.0 {
         log::warn!("Output is all zeros — weights may not have loaded correctly");
     } else {
         log::info!("Output contains non-zero values — weights loaded successfully");
     }
 
     log::info!("Done!");
+}
+
+/// Parse CLI args and return model path.
+fn parse_args() -> PathBuf {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1) {
+        Some(path) => PathBuf::from(path),
+        None => {
+            eprintln!("Usage: gemma2-inference <model-path>");
+            eprintln!();
+            eprintln!("Arguments:");
+            eprintln!("  <model-path>  Path to safetensors file, directory, or index JSON");
+            eprintln!();
+            eprintln!("Examples:");
+            eprintln!("  gemma2-inference model.safetensors");
+            eprintln!("  gemma2-inference /path/to/gemma-2-2b/");
+            eprintln!("  gemma2-inference model.safetensors.index.json");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn print_load_report(report: &LoadReport) {
@@ -106,4 +100,57 @@ fn print_load_report(report: &LoadReport) {
     if !report.tensors_skipped.is_empty() {
         log::info!("  Tensors skipped: {}", report.tensors_skipped.len());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Main: Select Backend
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "ndarray")]
+fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    use burn_ndarray::NdArray;
+
+    type B = NdArray<f32>;
+
+    let model_path = parse_args();
+    let device = Default::default();
+    run_inference::<B>(model_path, device);
+}
+
+#[cfg(feature = "wgpu")]
+fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    use burn::backend::wgpu::Wgpu;
+
+    type B = Wgpu<f32, i64>;
+
+    let model_path = parse_args();
+    let device = Default::default();
+    run_inference::<B>(model_path, device);
+}
+
+#[cfg(feature = "metal")]
+fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    use burn::backend::metal::Metal;
+
+    type B = Metal<f32, i64>;
+
+    let model_path = parse_args();
+    let device = Default::default();
+    run_inference::<B>(model_path, device);
+}
+
+#[cfg(not(any(feature = "ndarray", feature = "wgpu", feature = "metal")))]
+fn main() {
+    compile_error!(
+        "Enable a backend feature:\n  \
+         --features ndarray    (CPU, for testing)\n  \
+         --features wgpu       (WGPU/Metal)\n  \
+         --features metal      (Metal native)"
+    );
 }

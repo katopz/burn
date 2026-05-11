@@ -15,8 +15,6 @@ use std::path::PathBuf;
 
 use burn::module::Module;
 use burn::tensor::{Int, Tensor};
-#[cfg(feature = "ndarray")]
-use burn_ndarray::NdArray;
 use clap::Parser;
 use lora_gemma4::loader::load_gemma4_weights;
 use lora_gemma4::{Gemma4Config, Gemma4Model};
@@ -73,11 +71,8 @@ fn default_safetensors_path() -> Option<PathBuf> {
     None
 }
 
-fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-    let args = Args::parse();
-
+/// Run weight loading and verification with a specific backend.
+fn run<B: burn::tensor::backend::Backend>(args: Args, device: B::Device) {
     // Resolve safetensors path
     let safetensors_path = match &args.path {
         Some(p) => PathBuf::from(p),
@@ -111,9 +106,6 @@ fn main() {
         "Estimated memory: ~{:.0} GB (BF16→F32 upcast)",
         file_size_gb * 2.0
     );
-
-    type B = NdArray<f32>;
-    let device = Default::default();
 
     // Build model with full E4B config
     let config = Gemma4Config::gemma4_e4b();
@@ -283,4 +275,57 @@ fn main() {
     log::info!("Last position predicted token ID: {predicted_token}");
 
     log::info!("✓ Weight loading and forward pass verification PASSED");
+}
+
+// ---------------------------------------------------------------------------
+// Main: Select Backend
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "ndarray")]
+fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    use burn_ndarray::NdArray;
+
+    type B = NdArray<f32>;
+
+    let args = Args::parse();
+    let device = Default::default();
+    run::<B>(args, device);
+}
+
+#[cfg(feature = "wgpu")]
+fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    use burn::backend::wgpu::Wgpu;
+
+    type B = Wgpu<f32, i64>;
+
+    let args = Args::parse();
+    let device = Default::default();
+    run::<B>(args, device);
+}
+
+#[cfg(feature = "metal")]
+fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    use burn::backend::metal::Metal;
+
+    type B = Metal<f32, i64>;
+
+    let args = Args::parse();
+    let device = Default::default();
+    run::<B>(args, device);
+}
+
+#[cfg(not(any(feature = "ndarray", feature = "wgpu", feature = "metal")))]
+fn main() {
+    compile_error!(
+        "Enable a backend feature:\n  \
+         --features ndarray    (CPU, for testing)\n  \
+         --features wgpu       (WGPU/Metal)\n  \
+         --features metal      (Metal native)"
+    );
 }

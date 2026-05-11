@@ -86,6 +86,8 @@ struct SftArgs {
     val_split: f64,
     /// Random seed.
     seed: u64,
+    /// Path to local tokenizer.json file (overrides --model-name for tokenizer).
+    tokenizer: Option<String>,
 }
 
 impl SftArgs {
@@ -104,6 +106,7 @@ impl SftArgs {
             max_seq_length: 2048,
             val_split: 0.1,
             seed: 42,
+            tokenizer: None,
         };
 
         let cli: Vec<String> = std::env::args().collect();
@@ -197,6 +200,14 @@ impl SftArgs {
                         .expect("invalid seed");
                     i += 2;
                 }
+                "--tokenizer" => {
+                    args.tokenizer = Some(
+                        cli.get(i + 1)
+                            .expect("--tokenizer requires a value")
+                            .clone(),
+                    );
+                    i += 2;
+                }
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -220,23 +231,26 @@ impl SftArgs {
 }
 
 fn print_usage() {
-    eprintln!("Usage: sft-train --dataset <path> [options]");
+    eprintln!("Usage: sft-train [OPTIONS]");
     eprintln!();
     eprintln!("Required:");
-    eprintln!("  --dataset <path>        Path to JSONL training data");
+    eprintln!("  --dataset <PATH>         JSONL training data path");
     eprintln!();
-    eprintln!("Optional:");
-    eprintln!("  --output-dir <path>     Output directory (default: /tmp/sft-output)");
-    eprintln!("  --model-name <name>     HF model name for tokenizer (default: google/gemma-2-2b)");
-    eprintln!("  --weights <path>        Path to safetensors model weights");
-    eprintln!("  --lora-rank <n>         LoRA rank (default: 16)");
-    eprintln!("  --lora-alpha <f>        LoRA alpha (default: 32.0)");
-    eprintln!("  --epochs <n>            Training epochs (default: 3)");
-    eprintln!("  --batch-size <n>        Batch size (default: 4)");
-    eprintln!("  --lr <f>                Learning rate (default: 2e-4)");
-    eprintln!("  --max-seq-length <n>    Max sequence length (default: 2048)");
-    eprintln!("  --val-split <f>         Validation split (default: 0.1)");
-    eprintln!("  --seed <n>              Random seed (default: 42)");
+    eprintln!("Options:");
+    eprintln!("  --output-dir <DIR>       Output directory (default: /tmp/sft-output)");
+    eprintln!(
+        "  --model-name <NAME>      HF model name for tokenizer (default: google/gemma-2-2b)"
+    );
+    eprintln!("  --tokenizer <PATH>       Local tokenizer.json path (overrides --model-name)");
+    eprintln!("  --weights <PATH>         Safetensors model weights path");
+    eprintln!("  --lora-rank <N>          LoRA rank (default: 16)");
+    eprintln!("  --lora-alpha <F>         LoRA alpha (default: 32.0)");
+    eprintln!("  --epochs <N>             Training epochs (default: 3)");
+    eprintln!("  --batch-size <N>         Batch size (default: 4)");
+    eprintln!("  --lr <F>                 Learning rate (default: 2e-4)");
+    eprintln!("  --max-seq-length <N>     Max sequence length (default: 2048)");
+    eprintln!("  --val-split <F>          Validation split ratio (default: 0.1)");
+    eprintln!("  --seed <N>               Random seed (default: 42)");
 }
 
 // ---------------------------------------------------------------------------
@@ -252,16 +266,33 @@ fn run<B: AutodiffBackend>(args: SftArgs, device: B::Device) {
     // -----------------------------------------------------------------------
     // 1. Load Tokenizer
     // -----------------------------------------------------------------------
-    log::info!("[1/8] Loading tokenizer from '{}'", args.model_name);
-    let tokenizer = match GemmaTokenizer::from_pretrained(&args.model_name) {
-        Ok(t) => {
-            log::info!("  Tokenizer loaded (vocab_size={})", t.vocab_size());
-            t
+    let tokenizer = match &args.tokenizer {
+        Some(path) => {
+            log::info!("[1/8] Loading tokenizer from file '{path}'");
+            match GemmaTokenizer::from_file(path) {
+                Ok(t) => {
+                    log::info!("  Tokenizer loaded (vocab_size={})", t.vocab_size());
+                    t
+                }
+                Err(e) => {
+                    log::error!("Failed to load tokenizer: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
-        Err(e) => {
-            log::error!("Failed to load tokenizer: {e}");
-            log::error!("Make sure the model name is correct and you have network access.");
-            std::process::exit(1);
+        None => {
+            log::info!("[1/8] Loading tokenizer from '{}'", args.model_name);
+            match GemmaTokenizer::from_pretrained(&args.model_name) {
+                Ok(t) => {
+                    log::info!("  Tokenizer loaded (vocab_size={})", t.vocab_size());
+                    t
+                }
+                Err(e) => {
+                    log::error!("Failed to load tokenizer: {e}");
+                    log::error!("Set HF_TOKEN or use --tokenizer /path/to/tokenizer.json");
+                    std::process::exit(1);
+                }
+            }
         }
     };
     let pad_token_id = tokenizer.pad_token_id();

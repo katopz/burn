@@ -17,9 +17,8 @@
 //! # Note on RMSNorm convention
 //!
 //! Gemma 4 uses `output * weight` (weight init=1, ones-based).
-//! Burn's RmsNorm uses `output * (1 + gamma)` (gamma init=0, zeros-based).
-//! These are equivalent: `weight = 1 + gamma`.
-//! The weight loader must convert: `gamma = weight - 1.0`.
+//! Burn's RmsNorm also uses `output * gamma` (gamma init=1, ones-based via `Initializer::Ones`).
+//! These are identical: no conversion needed in the weight loader.
 
 use burn::module::{Content, DisplaySettings, Module, ModuleDisplay};
 use burn::nn::{
@@ -31,14 +30,14 @@ use burn::tensor::{Int, Tensor, activation::gelu, activation::softmax, backend::
 use crate::types::{Gemma4Config, LayerType};
 
 /// Type alias for KV cache pair: (keys, values) each `[batch, heads, seq, head_dim]`.
-type KvPair<B> = Option<(Tensor<B, 4>, Tensor<B, 4>)>;
+pub type KvPair<B> = Option<(Tensor<B, 4>, Tensor<B, 4>)>;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /// Full causal mask: position i attends to positions 0..=i.
-fn causal_mask<B: Backend>(seq_len: usize, device: &B::Device) -> Tensor<B, 2> {
+pub fn causal_mask<B: Backend>(seq_len: usize, device: &B::Device) -> Tensor<B, 2> {
     let positions = Tensor::<B, 1, Int>::arange(0..seq_len as i64, device).float();
     let row = positions.clone().reshape([seq_len, 1]);
     let col = positions.reshape([1, seq_len]);
@@ -48,7 +47,7 @@ fn causal_mask<B: Backend>(seq_len: usize, device: &B::Device) -> Tensor<B, 2> {
 }
 
 /// Sliding window causal mask: position i attends to max(0, i-window+1)..=i.
-fn sliding_window_mask<B: Backend>(
+pub fn sliding_window_mask<B: Backend>(
     seq_len: usize,
     window: usize,
     device: &B::Device,
@@ -71,7 +70,10 @@ fn sliding_window_mask<B: Backend>(
 }
 
 /// RMS normalization without learnable scale (for v_norm).
-fn rms_norm_no_scale<B: Backend, const D: usize>(x: Tensor<B, D>, epsilon: f64) -> Tensor<B, D> {
+pub fn rms_norm_no_scale<B: Backend, const D: usize>(
+    x: Tensor<B, D>,
+    epsilon: f64,
+) -> Tensor<B, D> {
     let rms = x
         .clone()
         .powf_scalar(2.0)

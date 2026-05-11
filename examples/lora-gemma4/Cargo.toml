@@ -28,6 +28,7 @@ remote = ["burn/remote", "burn/default"]
 burn = { path = "../../crates/burn", features = ["train", "tui"] }
 burn-ndarray = { path = "../../crates/burn-ndarray", optional = true }
 burn-store = { path = "../../crates/burn-store", features = ["std", "safetensors"] }
+clap = { workspace = true, features = ["derive"] }
 log = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true, features = ["std", "derive"] }

@@ -34,8 +34,20 @@
 
 extern crate alloc;
 
+pub mod batcher;
+pub mod dataset;
+pub mod loader;
 pub mod model;
+pub mod model_lora;
+pub mod tokenizer;
 pub mod types;
 
+pub use batcher::{SFTBatch, SFTBatcher};
+pub use dataset::{ChatItem, ChatMessageSerde, DatasetError, JsonlDataset};
+pub use loader::{LoadError, LoadReport};
 pub use model::{Gemma4Attention, Gemma4Block, Gemma4MLP, Gemma4Model};
+pub use model_lora::{
+    Gemma4ForSFT, Gemma4ModelLora, apply_lora_to_gemma4, count_lora_params, count_total_params,
+};
+pub use tokenizer::{ChatMessage, GemmaTokenizer, Role, TokenizerError};
 pub use types::{Gemma4Config, LayerType, LoraTarget, RopeParams};

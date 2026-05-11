@@ -416,6 +416,12 @@ Additional examples:
   [`Learner`](./building-blocks/learner.md) progress.
 - [Image Classification Web](./examples/image-classification-web) : Image classification web browser
   demo using Burn, WGPU and WebAssembly.
+- [LoRA Fine-tuning](./examples/lora-finetuning) : Demonstrates parameter-efficient fine-tuning
+  using LoRA (Low-Rank Adaptation) on a simple MLP with adapter saving, loading, and weight merging.
+- [LoRA Gemma 2](./examples/lora-gemma2) : LoRA fine-tuning pipeline for Gemma 2 models with
+  HuggingFace safetensors weight loading, BF16/F16 support, and SFT training.
+- [LoRA Gemma 4](./examples/lora-gemma4) : LoRA fine-tuning pipeline for Gemma 4 models with
+  Metal F16 support, autodiff weight loading, and SFT training.
 - [MNIST Inference on Web](./examples/mnist-inference-web) : An interactive MNIST inference demo in
   the browser. The demo is available [online](https://burn.dev/demo/).
 - [MNIST Training](./examples/mnist) : Demonstrates how to train a custom `Module` (MLP) with the

@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn test_format_chat_template_basic() {
-        let _messages = vec![
+        let _messages = [
             ChatMessage::user("What is Rust?"),
             ChatMessage::assistant("Rust is a systems programming language."),
         ];

@@ -50,6 +50,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use burn::data::dataloader::DataLoaderBuilder;
+use burn::module::AutodiffModule;
 use burn::nn::lora::{LoraBias, LoraConfig};
 use burn::optim::AdamConfig;
 use burn::record::CompactRecorder;
@@ -390,7 +391,8 @@ fn run<B: AutodiffBackend>(args: SftArgs, device: B::Device) {
         config.hidden_size_per_layer_input
     );
 
-    let mut model = Gemma4Model::<B>::new(&config, &device);
+    // Create on inner backend (no autodiff) so loaded weights become leaf tensors
+    let mut inner_model = Gemma4Model::<B::InnerBackend>::new(&config, &device);
 
     // -----------------------------------------------------------------------
     // 6. Load Pretrained Weights (if provided)
@@ -398,7 +400,11 @@ fn run<B: AutodiffBackend>(args: SftArgs, device: B::Device) {
     match &args.weights {
         Some(weights_path) => {
             log::info!("[5/8] Loading weights from '{weights_path}'");
-            match load_gemma4_weights(&mut model, PathBuf::from(weights_path).as_path(), &device) {
+            match load_gemma4_weights(
+                &mut inner_model,
+                PathBuf::from(weights_path).as_path(),
+                &device,
+            ) {
                 Ok(report) => {
                     log::info!(
                         "  Loaded {} tensors from {} files",
@@ -419,6 +425,10 @@ fn run<B: AutodiffBackend>(args: SftArgs, device: B::Device) {
             log::warn!("  This is only useful for testing the training pipeline.");
         }
     }
+
+    // Convert to autodiff backend — from_inner creates proper leaf tensors
+    // that can be tracked for gradient computation during LoRA training
+    let model = Gemma4Model::<B>::from_inner(inner_model);
 
     // -----------------------------------------------------------------------
     // 7. Apply LoRA
@@ -553,7 +563,7 @@ fn main() {
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    use burn::backend::{Autodiff, metal::Metal};
+    use burn::backend::{Autodiff, Metal};
 
     type Backend = Metal<f32, i64>;
     type AD = Autodiff<Backend>;

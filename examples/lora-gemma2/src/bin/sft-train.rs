@@ -47,13 +47,14 @@ use burn::module::AutodiffModule;
 use burn::nn::lora::{LoraBias, LoraConfig};
 use burn::optim::AdamConfig;
 use burn::record::CompactRecorder;
+use burn::tensor::Element;
 use burn::tensor::backend::AutodiffBackend;
 use burn::train::metric::LossMetric;
 use burn::train::{Learner, SupervisedTraining};
 
 use lora_gemma2::batcher::SFTBatcher;
 use lora_gemma2::dataset::JsonlDataset;
-use lora_gemma2::loader::load_gemma2_weights;
+use lora_gemma2::loader::load_gemma2_weights_dtype;
 use lora_gemma2::model::Gemma2Model;
 use lora_gemma2::model_lora::{
     Gemma2ForSFT, apply_lora_to_gemma2, count_lora_params, count_total_params,
@@ -383,10 +384,11 @@ fn run<B: AutodiffBackend>(args: SftArgs, device: B::Device) {
     match &args.weights {
         Some(weights_path) => {
             log::info!("[5/8] Loading weights from '{weights_path}'");
-            match load_gemma2_weights(
+            match load_gemma2_weights_dtype(
                 &mut inner_model,
                 PathBuf::from(weights_path).as_path(),
                 &device,
+                <B::FloatElem as Element>::dtype(),
             ) {
                 Ok(report) => {
                     log::info!(
@@ -546,8 +548,11 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     use burn::backend::{Autodiff, Metal};
+    use burn::tensor::f16;
 
-    type Backend = Metal<f32, i64>;
+    // Use f16 on Metal to halve memory (~16GB vs ~32GB for Gemma 4 E4B).
+    // Metal does not support BF16, so BF16 weights are converted to F16 during loading.
+    type Backend = Metal<f16, i64>;
     type AD = Autodiff<Backend>;
 
     let args = SftArgs::parse();

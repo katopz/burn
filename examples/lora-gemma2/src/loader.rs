@@ -68,6 +68,48 @@ impl ModuleAdapter for Bf16ToF32Adapter {
 }
 
 // ---------------------------------------------------------------------------
+// BF16 → F16 Adapter (for Metal backend)
+// ---------------------------------------------------------------------------
+
+/// Adapter that converts BF16 tensors to F16 during loading.
+///
+/// HuggingFace Gemma 2 weights are stored in BF16, but Metal/WGPU
+/// doesn't support BF16. This adapter converts BF16→F16, halving memory
+/// compared to F32 (16GB vs 32GB for Gemma 4 E4B).
+///
+/// Use with `Metal<f16>` backend. Chain after `PyTorchToBurnAdapter`.
+#[derive(Debug, Clone)]
+pub struct Bf16ToF16Adapter;
+
+impl ModuleAdapter for Bf16ToF16Adapter {
+    fn adapt(&self, snapshot: &TensorSnapshot) -> TensorSnapshot {
+        if snapshot.dtype != DType::BF16 {
+            return snapshot.clone();
+        }
+
+        let original_data_fn = snapshot.clone_data_fn();
+
+        let cast_data_fn = Rc::new(move || {
+            let data = original_data_fn()?;
+            Ok(data.convert_dtype(DType::F16))
+        });
+
+        TensorSnapshot::from_closure(
+            cast_data_fn,
+            DType::F16,
+            snapshot.shape.clone(),
+            snapshot.path_stack.clone().unwrap_or_default(),
+            snapshot.container_stack.clone().unwrap_or_default(),
+            snapshot.tensor_id.unwrap_or_default(),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ModuleAdapter> {
+        Box::new(self.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Error & Report Types
 // ---------------------------------------------------------------------------
 
@@ -380,6 +422,19 @@ pub fn load_gemma2_weights<B: Backend>(
     path: &Path,
     device: &B::Device,
 ) -> Result<LoadReport, LoadError> {
+    load_gemma2_weights_dtype(model, path, device, DType::F32)
+}
+
+/// Load Gemma 2 weights with explicit target dtype.
+///
+/// Use `DType::F32` for NdArray (CPU) and `DType::F16` for Metal/WGPU.
+/// BF16 safetensors are converted to the target dtype during loading.
+pub fn load_gemma2_weights_dtype<B: Backend>(
+    model: &mut Gemma2Model<B>,
+    path: &Path,
+    device: &B::Device,
+    target_dtype: DType,
+) -> Result<LoadReport, LoadError> {
     let files = resolve_safetensors_files(path)?;
 
     if files.is_empty() {
@@ -402,7 +457,10 @@ pub fn load_gemma2_weights<B: Backend>(
 
         log::info!("Loading weights from: {file_name}");
 
-        let adapter = PyTorchToBurnAdapter.chain(Bf16ToF32Adapter);
+        let adapter = match target_dtype {
+            DType::F16 => PyTorchToBurnAdapter.chain(Bf16ToF16Adapter),
+            _ => PyTorchToBurnAdapter.chain(Bf16ToF32Adapter),
+        };
         let mut store = SafetensorsStore::from_file(file_path)
             .remap(remapper.clone())
             .with_from_adapter(adapter)

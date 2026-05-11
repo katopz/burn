@@ -18,9 +18,9 @@
 use std::path::PathBuf;
 
 use burn::module::Module;
-use burn::tensor::{Int, Tensor};
+use burn::tensor::{Element, Int, Tensor};
 use clap::Parser;
-use lora_gemma4::loader::load_gemma4_weights;
+use lora_gemma4::loader::load_gemma4_weights_dtype;
 use lora_gemma4::{Gemma4Config, Gemma4Model};
 
 /// Gemma 4 weight loading and forward pass verification.
@@ -141,7 +141,12 @@ fn run<B: burn::tensor::backend::Backend>(args: Args, device: B::Device) {
     log::info!("Loading weights from safetensors...");
     let load_start = std::time::Instant::now();
 
-    let report = match load_gemma4_weights(&mut model, &safetensors_path, &device) {
+    let report = match load_gemma4_weights_dtype(
+        &mut model,
+        &safetensors_path,
+        &device,
+        <B::FloatElem as Element>::dtype(),
+    ) {
         Ok(r) => r,
         Err(e) => {
             log::error!("Failed to load weights: {e}");
@@ -316,8 +321,10 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     use burn::backend::Metal;
+    use burn::tensor::f16;
 
-    type B = Metal<f32, i64>;
+    // Use f16 on Metal to halve memory (~16GB vs ~32GB for Gemma 4 E4B).
+    type B = Metal<f16, i64>;
 
     let args = Args::parse();
     let device = Default::default();

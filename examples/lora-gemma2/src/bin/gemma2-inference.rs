@@ -16,8 +16,8 @@
 use std::path::PathBuf;
 
 use burn::prelude::ElementConversion;
-use burn::tensor::{Int, Tensor};
-use lora_gemma2::loader::load_gemma2_weights;
+use burn::tensor::{Element, Int, Tensor};
+use lora_gemma2::loader::load_gemma2_weights_dtype;
 use lora_gemma2::{Gemma2Config, Gemma2Model, LoadReport};
 
 /// Run inference with a specific backend.
@@ -34,7 +34,12 @@ fn run_inference<B: burn::tensor::backend::Backend>(model_path: PathBuf, device:
     // Load weights
     log::info!("Loading weights from: {}", model_path.display());
 
-    let report = match load_gemma2_weights(&mut model, &model_path, &device) {
+    let report = match load_gemma2_weights_dtype(
+        &mut model,
+        &model_path,
+        &device,
+        <B::FloatElem as Element>::dtype(),
+    ) {
         Ok(report) => report,
         Err(e) => {
             eprintln!("Error loading weights: {e}");
@@ -141,8 +146,11 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     use burn::backend::Metal;
+    use burn::tensor::f16;
 
-    type B = Metal<f32, i64>;
+    // Use f16 on Metal to halve memory.
+    // Metal does not support BF16, so BF16 weights are converted to F16 during loading.
+    type B = Metal<f16, i64>;
 
     let model_path = parse_args();
     let device = Default::default();

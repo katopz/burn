@@ -124,6 +124,17 @@ impl<B: Backend> Gemma4AttentionLora<B> {
         let [batch, seq, _hidden] = x.dims();
         let kv_groups = self.num_heads / self.num_kv_heads;
 
+        // For full attention layers (head_dim=512), cast input to f32 to prevent
+        // f16 overflow in Q/K/V linear projections. f16 max ~65504; accumulating
+        // over hidden_size=2560 elements with output dim 4096 easily overflows.
+        // HF/PyTorch avoids this by using bf16 (same range as f32) for weights.
+        let original_dtype = B::FloatElem::dtype();
+        let x = if self.layer_type == LayerType::Full {
+            x.cast(DType::F32)
+        } else {
+            x
+        };
+
         // --- Query (LoRA) ---
         let q = self.q_proj.forward(x.clone());
         let q = q.reshape([batch, seq, self.num_heads, self.head_dim]);
@@ -170,7 +181,6 @@ impl<B: Backend> Gemma4AttentionLora<B> {
         // HF computes entire attention in float32 to avoid f16 precision loss:
         //   torch.matmul(query, key_states.transpose(2, 3)) * scaling
         //   nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-        let original_dtype = B::FloatElem::dtype();
         let scores = q
             .cast(DType::F32)
             .matmul(keys.cast(DType::F32).swap_dims(2, 3));
@@ -189,6 +199,13 @@ impl<B: Backend> Gemma4AttentionLora<B> {
             .swap_dims(1, 2)
             .reshape([batch, seq, self.num_heads * self.head_dim]);
         let output = self.o_proj.forward(output);
+
+        // Cast back to original dtype if we promoted to f32 for full attention
+        let output = if self.layer_type == LayerType::Full {
+            output.cast(original_dtype)
+        } else {
+            output
+        };
 
         (output, own_kv)
     }

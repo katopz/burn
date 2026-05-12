@@ -30,8 +30,10 @@ pub struct Gemma2Config {
     /// Number of key/value attention heads (GQA, e.g., 4 for Gemma 2 2B).
     pub num_key_value_heads: usize,
 
-    /// Dimension per attention head: `hidden_size / num_attention_heads`.
-    /// Gemma 2 2B: 2304/8 = 288, Gemma 2 9B: 3584/16 = 224.
+    /// Dimension per attention head. In Gemma 2, this is a separate HF config value
+    /// (NOT derived from hidden_size / num_attention_heads).
+    /// 2B: head_dim=256, but hidden_size/num_heads=288 (attention is smaller than hidden).
+    /// 9B: head_dim=224 = hidden_size/num_heads (attention uses full hidden).
     pub head_dim: usize,
 
     /// Scalar for attention scaling. Separate from head_dim in Gemma 2.
@@ -73,7 +75,7 @@ impl Gemma2Config {
 /// Preset configuration for Gemma 2 2B.
 impl Gemma2Config {
     /// Gemma 2 2B configuration.
-    /// Gemma 2 2B: head_dim = 2304/8 = 288, query_pre_attn_scalar = 256.
+    /// head_dim=256 (from HF config), query_pre_attn_scalar=256.
     pub fn gemma2_2b() -> Self {
         Self::new(
             256000, // vocab_size
@@ -82,7 +84,7 @@ impl Gemma2Config {
             9216,   // intermediate_size
             8,      // num_attention_heads
             4,      // num_key_value_heads
-            288,    // head_dim (hidden_size / num_attention_heads)
+            256,    // head_dim (from HF config, NOT hidden_size / num_attention_heads)
         )
         .with_query_pre_attn_scalar(256)
     }
@@ -96,7 +98,7 @@ impl Gemma2Config {
             14336,  // intermediate_size
             16,     // num_attention_heads
             8,      // num_key_value_heads
-            224,    // head_dim (hidden_size / num_attention_heads)
+            224,    // head_dim (= hidden_size / num_attention_heads for 9B)
         )
         .with_query_pre_attn_scalar(256)
     }
@@ -189,7 +191,7 @@ mod tests {
         assert_eq!(config.intermediate_size, 9216);
         assert_eq!(config.num_attention_heads, 8);
         assert_eq!(config.num_key_value_heads, 4);
-        assert_eq!(config.head_dim, 288); // hidden_size / num_attention_heads = 2304/8
+        assert_eq!(config.head_dim, 256); // from HF config (NOT hidden_size / num_attention_heads)
         assert_eq!(config.query_pre_attn_scalar, 256); // separate from head_dim in Gemma 2
     }
 

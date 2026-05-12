@@ -19,6 +19,49 @@ use cubek::matmul::{
     },
 };
 
+/// Wraps [`launch_matmul`] with panic handling so cubek panics (e.g., divide-by-zero in tiling
+/// blueprint autotune) are converted to `Err`, allowing the autotune system to skip the kernel.
+fn launch_matmul_safe<R: CubeRuntime>(
+    strategy: &Strategy,
+    lhs: CubeTensor<R>,
+    rhs: CubeTensor<R>,
+    out: CubeTensor<R>,
+) -> Result<(), String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        launch_matmul::<R>(strategy, lhs, rhs, out)
+    }))
+    .map_err(|payload| {
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        format!("launch_matmul panicked: {msg}")
+    })?
+    .map_err(|err| format!("{err:?}"))
+}
+
+/// Wraps [`launch_matmul_naive`] with the same panic handling.
+fn launch_matmul_naive_safe<R: CubeRuntime>(
+    strategy: &Strategy,
+    lhs: CubeTensor<R>,
+    rhs: CubeTensor<R>,
+    out: CubeTensor<R>,
+) -> Result<(), String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        launch_matmul_naive::<R>(strategy, lhs, rhs, out)
+    }))
+    .map_err(|payload| {
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        format!("launch_matmul_naive panicked: {msg}")
+    })?
+    .map_err(|err| format!("{err:?}"))
+}
+
 fn matmul_input_gen<R: CubeRuntime>(
     _key: &MatmulAutotuneKey,
     (lhs, rhs, out): &(CubeTensor<R>, CubeTensor<R>, CubeTensor<R>),
@@ -162,8 +205,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
         // First entry should always work, since it is considered the fallback.
         set = set.with(
             Tunable::new("matmul_naive", |(lhs, rhs, out)| {
-                launch_matmul_naive::<R>(&Strategy::Naive, lhs, rhs, out)
-                    .map_err(|err| std::format!("{err:?}"))
+                launch_matmul_naive_safe::<R>(&Strategy::Naive, lhs, rhs, out)
             })
             .group(&unit, |key| {
                 if matches!(key.analysis.kind, MatmulKind::InnerProduct) {
@@ -197,8 +239,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
         ] {
             set = set.with(
                 Tunable::new(&strategy.to_string(), move |(lhs, rhs, out)| {
-                    launch_matmul::<R>(&strategy, lhs, rhs, out)
-                        .map_err(|err| std::format!("{err:?}"))
+                    launch_matmul_safe::<R>(&strategy, lhs, rhs, out)
                 })
                 .group(&gemv, move |key| match double_buf {
                     false => PRIORITY_MAX,
@@ -228,8 +269,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
             ] {
                 set = set.with(
                     Tunable::new(&strategy.to_string(), move |(lhs, rhs, out)| {
-                        launch_matmul::<R>(&strategy, lhs, rhs, out)
-                            .map_err(|err| format!("{err:?}"))
+                        launch_matmul_safe::<R>(&strategy, lhs, rhs, out)
                     })
                     .group(&unit, move |key| match double_buf {
                         false => PRIORITY_MAX,
@@ -424,7 +464,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 true => double_buffering_priority(key, PRIORITY_MAX, PRIORITY_HIGH),
             };
             let mut tunable = Tunable::new(&strategy.to_string(), move |(lhs, rhs, out)| {
-                launch_matmul::<R>(&strategy, lhs, rhs, out).map_err(|err| format!("{err:?}"))
+                launch_matmul_safe::<R>(&strategy, lhs, rhs, out)
             });
 
             // tile group

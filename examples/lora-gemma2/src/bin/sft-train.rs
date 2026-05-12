@@ -38,17 +38,19 @@
 //! | `--max-seq-length` | `2048` | Maximum sequence length |
 //! | `--val-split` | `0.1` | Validation split ratio |
 //! | `--seed` | `42` | Random seed |
+//! | `--quantize` | `none` | Quantize frozen weights: `none`, `q4s`, `q8s` |
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use burn::data::dataloader::DataLoaderBuilder;
-use burn::module::AutodiffModule;
+use burn::module::{AutodiffModule, Module, Quantizer};
 use burn::nn::lora::{LoraBias, LoraConfig};
 use burn::optim::AdamConfig;
 use burn::record::CompactRecorder;
 use burn::tensor::Element;
 use burn::tensor::backend::AutodiffBackend;
+use burn::tensor::quantization::{Calibration, QuantLevel, QuantScheme, QuantValue};
 use burn::train::metric::LossMetric;
 use burn::train::{Learner, SupervisedTraining};
 
@@ -94,6 +96,8 @@ struct SftArgs {
     seed: u64,
     /// Path to local tokenizer.json file (overrides --model-name for tokenizer).
     tokenizer: Option<String>,
+    /// Quantization scheme for frozen weights: none, q4s, q8s (default: none).
+    quantize: String,
 }
 
 impl SftArgs {
@@ -113,6 +117,7 @@ impl SftArgs {
             val_split: 0.1,
             seed: 42,
             tokenizer: None,
+            quantize: "none".into(),
         };
 
         let cli: Vec<String> = std::env::args().collect();
@@ -214,6 +219,10 @@ impl SftArgs {
                     );
                     i += 2;
                 }
+                "--quantize" => {
+                    args.quantize = cli.get(i + 1).expect("--quantize requires a value").clone();
+                    i += 2;
+                }
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -233,6 +242,28 @@ impl SftArgs {
         }
 
         args
+    }
+}
+
+/// Valid quantization schemes for the `--quantize` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuantizeScheme {
+    /// No quantization (full precision).
+    None,
+    /// 4-bit symmetric quantization.
+    Q4S,
+    /// 8-bit symmetric quantization.
+    Q8S,
+}
+
+impl QuantizeScheme {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "q4s" => Some(Self::Q4S),
+            "q8s" => Some(Self::Q8S),
+            _ => None,
+        }
     }
 }
 
@@ -257,6 +288,7 @@ fn print_usage() {
     eprintln!("  --max-seq-length <N>     Max sequence length (default: 2048)");
     eprintln!("  --val-split <F>          Validation split ratio (default: 0.1)");
     eprintln!("  --seed <N>               Random seed (default: 42)");
+    eprintln!("  --quantize <SCHEME>      Quantize frozen weights: none, q4s, q8s (default: none)");
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +442,47 @@ fn run<B: AutodiffBackend>(args: SftArgs, device: B::Device) {
             log::warn!("  This is only useful for testing the training pipeline.");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // 6b. Quantize Frozen Weights (optional)
+    // -----------------------------------------------------------------------
+    let quant_scheme = QuantizeScheme::from_str(&args.quantize).unwrap_or_else(|| {
+        eprintln!(
+            "Error: unknown quantize scheme '{}'. Use: none, q4s, q8s",
+            args.quantize
+        );
+        std::process::exit(1);
+    });
+
+    let inner_model = match quant_scheme {
+        QuantizeScheme::None => inner_model,
+        QuantizeScheme::Q4S => {
+            log::info!("[5b/8] Quantizing frozen weights to Q4S (4-bit symmetric)");
+            let scheme = QuantScheme::default()
+                .with_value(QuantValue::Q4S)
+                .with_level(QuantLevel::Tensor);
+            let mut quantizer = Quantizer {
+                calibration: Calibration::MinMax,
+                scheme,
+            };
+            let quantized = inner_model.quantize_weights(&mut quantizer);
+            log::info!("  Quantization complete");
+            quantized
+        }
+        QuantizeScheme::Q8S => {
+            log::info!("[5b/8] Quantizing frozen weights to Q8S (8-bit symmetric)");
+            let scheme = QuantScheme::default()
+                .with_value(QuantValue::Q8S)
+                .with_level(QuantLevel::Tensor);
+            let mut quantizer = Quantizer {
+                calibration: Calibration::MinMax,
+                scheme,
+            };
+            let quantized = inner_model.quantize_weights(&mut quantizer);
+            log::info!("  Quantization complete");
+            quantized
+        }
+    };
 
     // Convert to autodiff backend — from_inner creates proper leaf tensors
     // that can be tracked for gradient computation during LoRA training

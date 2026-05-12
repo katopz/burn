@@ -1,5 +1,7 @@
+use alloc::vec;
+
 use crate::{
-    Bool, Int, Tensor, TensorPrimitive,
+    Bool, DType, Int, Shape, Tensor, TensorMetadata, TensorPrimitive,
     backend::Backend,
     check,
     check::TensorCheck,
@@ -513,11 +515,68 @@ pub fn linear<B: Backend, const D: usize>(
         return output.squeeze_dim(0);
     }
 
-    Tensor::new(TensorPrimitive::Float(B::linear(
-        input.primitive.tensor(),
-        weight.primitive.tensor(),
-        bias.map(|b| b.primitive.tensor()),
-    )))
+    // When weight is quantized, use B::q_matmul which operates on packed
+    // quantized values directly (CubeCL kernels), instead of B::linear which
+    // dequantizes first. This enables 4-bit quantized matmul on GPU.
+    if matches!(weight.primitive.dtype(), DType::QFloat(_)) {
+        let weight = unsqueeze_primitive(weight.into_primitive(), D);
+        let output = matmul_dispatch(input.into_primitive(), weight);
+        let output = output.tensor();
+
+        let output = match bias {
+            Some(bias) => {
+                let bias = unsqueeze_primitive(bias.into_primitive(), D);
+                TensorPrimitive::Float(B::float_add(output, bias.tensor()))
+            }
+            None => TensorPrimitive::Float(output),
+        };
+
+        Tensor::new(output)
+    } else {
+        Tensor::new(TensorPrimitive::Float(B::linear(
+            input.primitive.tensor(),
+            weight.primitive.tensor(),
+            bias.map(|b| b.primitive.tensor()),
+        )))
+    }
+}
+
+/// Reshape a tensor primitive by prepending size-1 dimensions until it has `target_ndims`.
+fn unsqueeze_primitive<B: Backend>(
+    primitive: TensorPrimitive<B>,
+    target_ndims: usize,
+) -> TensorPrimitive<B> {
+    let shape = primitive.shape();
+    let ndims = shape.num_dims();
+    if ndims >= target_ndims {
+        return primitive;
+    }
+    let mut new_dims = vec![1usize; target_ndims - ndims];
+    for i in 0..ndims {
+        new_dims.push(shape[i]);
+    }
+    match primitive {
+        TensorPrimitive::Float(t) => {
+            TensorPrimitive::Float(B::float_reshape(t, Shape::from(new_dims)))
+        }
+        TensorPrimitive::QFloat(t) => {
+            TensorPrimitive::QFloat(B::q_reshape(t, Shape::from(new_dims)))
+        }
+    }
+}
+
+/// Dispatch matmul through the kind-level Numeric dispatch, which routes QFloat
+/// operands to B::q_matmul (quantized GPU kernels) instead of dequantizing first.
+fn matmul_dispatch<B: Backend>(
+    lhs: TensorPrimitive<B>,
+    rhs: TensorPrimitive<B>,
+) -> TensorPrimitive<B> {
+    match (lhs, rhs) {
+        (TensorPrimitive::Float(lhs), TensorPrimitive::Float(rhs)) => {
+            TensorPrimitive::Float(B::float_matmul(lhs, rhs))
+        }
+        (lhs, rhs) => B::q_matmul(lhs, rhs),
+    }
 }
 
 /// Computes scaled dot-product attention: softmax(QKᵗ * scale) · V,

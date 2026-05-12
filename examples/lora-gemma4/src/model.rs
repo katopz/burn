@@ -25,7 +25,10 @@ use burn::nn::{
     Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, RotaryEncoding,
     RotaryEncodingConfig,
 };
-use burn::tensor::{Int, Tensor, activation::gelu, activation::softmax, backend::Backend};
+use burn::tensor::{
+    DType, Element, Int, Tensor, activation::gelu_approximate, activation::softmax,
+    backend::Backend,
+};
 
 use crate::types::{Gemma4Config, LayerType};
 
@@ -152,13 +155,28 @@ impl<B: Backend> Gemma4Attention<B> {
         let q_norm = norm_cfg.init(device);
         let k_norm = norm_cfg.init(device);
 
-        // RoPE — d_model = rotary dimensions (may be less than head_dim for partial rotation)
+        // RoPE — Proportional RoPE for full attention layers.
+        //
+        // HF's "proportional" rope_type normalizes frequencies by global_head_dim (512),
+        // NOT by rotary_dim (128). Standard burn RotaryEncoding normalizes by d_model
+        // (= rotary_dim), so we must rescale for partial rotation layers.
+        //
+        // burn default:  freq[i] = 1/(base^(2i/rotary_dim))
+        // HF proportional: freq[i] = 1/(base^(2i/head_dim))
+        // Fix: freq_fixed = freq^(rotary_dim / head_dim)
         let rope_params = config.rope_params_for(layer_type);
         let rotary_dim =
             ((effective_head_dim as f64) * (rope_params.partial_rotary_factor as f64)) as usize;
-        let rotary = RotaryEncodingConfig::new(config.max_position_embeddings, rotary_dim)
-            .with_theta(rope_params.rope_theta)
-            .init(device);
+        let rotary = if rope_params.partial_rotary_factor < 1.0 {
+            let scale = rotary_dim as f32 / effective_head_dim as f32;
+            RotaryEncodingConfig::new(config.max_position_embeddings, rotary_dim)
+                .with_theta(rope_params.rope_theta)
+                .init_with_frequency_scaling(|freq| freq.powf_scalar(scale), device)
+        } else {
+            RotaryEncodingConfig::new(config.max_position_embeddings, rotary_dim)
+                .with_theta(rope_params.rope_theta)
+                .init(device)
+        };
 
         Self {
             q_proj,
@@ -264,21 +282,23 @@ impl<B: Backend> Gemma4Attention<B> {
             (keys, values)
         };
 
-        // --- Attention scores (no softcapping!) ---
-        let scores = q.matmul(keys.swap_dims(2, 3)); // [batch, heads, seq, seq]
-        // Gemma 4: scale = 1.0 (no sqrt scaling)
+        // --- Attention scores in f32 to prevent f16 overflow (head_dim=512 for full attention) ---
+        // HF computes entire attention in float32 to avoid f16 precision loss:
+        //   torch.matmul(query, key_states.transpose(2, 3)) * scaling
+        //   nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+        let original_dtype = B::FloatElem::dtype();
+        let scores = q
+            .cast(DType::F32)
+            .matmul(keys.cast(DType::F32).swap_dims(2, 3));
 
         // --- Apply mask ---
         let scores = match mask {
-            Some(m) => {
-                let m4 = m.reshape([1, 1, seq, seq]);
-                scores.add(m4)
-            }
+            Some(m) => scores.add(m.cast(DType::F32).reshape([1, 1, seq, seq])),
             None => scores,
         };
 
-        // --- Softmax + weighted sum ---
-        let weights = softmax(scores, 3);
+        // Softmax in f32, then cast back for value weighted sum
+        let weights = softmax(scores, 3).cast(original_dtype);
         let output = weights.matmul(values); // [batch, heads, seq, head_dim]
 
         // --- Reshape + output projection ---
@@ -326,7 +346,7 @@ impl<B: Backend> Gemma4MLP<B> {
 
     /// Forward: `[batch, seq, hidden] -> [batch, seq, hidden]`.
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
-        let gate = gelu(self.gate_proj.forward(x.clone()));
+        let gate = gelu_approximate(self.gate_proj.forward(x.clone()));
         let up = self.up_proj.forward(x);
         self.down_proj.forward(gate.mul(up))
     }
@@ -445,7 +465,7 @@ impl<B: Backend> Gemma4Block<B> {
             per_layer_input,
         ) {
             let residual = h.clone();
-            let gate_val = gelu(gate.forward(h));
+            let gate_val = gelu_approximate(gate.forward(h));
             let gated = gate_val.mul(ple_input); // [batch, seq, ple_dim]
             let projected = proj.forward(gated); // [batch, seq, hidden]
             h = residual + norm.forward(projected);

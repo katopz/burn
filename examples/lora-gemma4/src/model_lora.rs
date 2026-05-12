@@ -39,7 +39,10 @@ use burn::nn::loss::CrossEntropyLossConfig;
 use burn::nn::{Embedding, Linear, RmsNorm, RotaryEncoding};
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder, RecorderError};
 use burn::tensor::backend::AutodiffBackend;
-use burn::tensor::{Int, Tensor, activation::gelu, activation::softmax, backend::Backend};
+use burn::tensor::{
+    DType, Element, Int, Tensor, activation::gelu_approximate, activation::softmax,
+    backend::Backend,
+};
 use burn::train::{InferenceStep, SequenceOutput, TrainOutput, TrainStep};
 
 use crate::model::{
@@ -163,16 +166,22 @@ impl<B: Backend> Gemma4AttentionLora<B> {
             false => (keys, values),
         };
 
-        // --- Attention scores (scale=1.0, no softcapping) ---
-        let scores = q.matmul(keys.swap_dims(2, 3));
+        // --- Attention scores in f32 to prevent f16 overflow (head_dim=512 for full attention) ---
+        // HF computes entire attention in float32 to avoid f16 precision loss:
+        //   torch.matmul(query, key_states.transpose(2, 3)) * scaling
+        //   nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+        let original_dtype = B::FloatElem::dtype();
+        let scores = q
+            .cast(DType::F32)
+            .matmul(keys.cast(DType::F32).swap_dims(2, 3));
 
         let scores = match mask {
-            Some(m) => scores.add(m.reshape([1, 1, seq, seq])),
+            Some(m) => scores.add(m.cast(DType::F32).reshape([1, 1, seq, seq])),
             None => scores,
         };
 
-        // --- Softmax + weighted sum ---
-        let weights = softmax(scores, 3);
+        // Softmax in f32, then cast back for value weighted sum
+        let weights = softmax(scores, 3).cast(original_dtype);
         let output = weights.matmul(values);
 
         // --- Reshape + output projection (LoRA) ---
@@ -200,7 +209,7 @@ pub struct Gemma4MLPLora<B: Backend> {
 impl<B: Backend> Gemma4MLPLora<B> {
     /// Forward pass: `[batch, seq, hidden] -> [batch, seq, hidden]`.
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
-        let gate = gelu(self.gate_proj.forward(x.clone()));
+        let gate = gelu_approximate(self.gate_proj.forward(x.clone()));
         let up = self.up_proj.forward(x);
         self.down_proj.forward(gate.mul(up))
     }
@@ -256,7 +265,7 @@ impl<B: Backend> Gemma4BlockLora<B> {
             per_layer_input,
         ) {
             let residual = h.clone();
-            let gate_val = gelu(gate.forward(h));
+            let gate_val = gelu_approximate(gate.forward(h));
             let gated = gate_val.mul(ple_input);
             let projected = proj.forward(gated);
             h = residual + norm.forward(projected);

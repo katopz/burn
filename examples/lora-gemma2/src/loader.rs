@@ -491,12 +491,16 @@ pub fn load_gemma2_weights_dtype<B: Backend>(
         files_read.push(file_name);
     }
 
-    // Warn about tied weights
+    // Handle tied weights: copy embed.weight → lm_head.weight (transposed)
+    // Gemma 2 uses tie_word_embeddings=true but safetensors omits lm_head.weight.
+    // Embedding weight is [vocab, hidden]; Linear weight is [hidden, vocab] in burn format.
     if had_embed && !had_lm_head {
-        log::warn!(
-            "lm_head.weight was not found in safetensors files. \
-             It may be tied to embed.weight in the original model. \
-             The lm_head will use random initialization."
+        let lm_weight = (*model.embed.weight).clone().transpose();
+        model.lm_head.weight = burn::module::Param::from_tensor(lm_weight);
+        log::info!(
+            "Tied embeddings: copied embed.weight to lm_head.weight (transposed [{vocab}, {hidden}] → [{hidden}, {vocab}])",
+            vocab = model.vocab_size,
+            hidden = model.hidden_size,
         );
     } else if !had_embed && had_lm_head {
         log::warn!(

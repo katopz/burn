@@ -39,7 +39,9 @@ use burn::nn::loss::CrossEntropyLossConfig;
 use burn::nn::{Embedding, Linear, RmsNorm, RotaryEncoding};
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder, RecorderError};
 use burn::tensor::backend::AutodiffBackend;
-use burn::tensor::{Int, Tensor, activation::gelu, activation::softmax, backend::Backend};
+use burn::tensor::{
+    Int, Tensor, activation::gelu_approximate, activation::softmax, backend::Backend,
+};
 use burn::train::{InferenceStep, SequenceOutput, TrainOutput, TrainStep};
 
 use crate::batcher::SFTTrainingBatch;
@@ -181,7 +183,7 @@ pub struct Gemma2MLPLora<B: Backend> {
 impl<B: Backend> Gemma2MLPLora<B> {
     /// Forward pass: `[batch, seq, hidden] -> [batch, seq, hidden]`.
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
-        let gate = gelu(self.gate_proj.forward(x.clone()));
+        let gate = gelu_approximate(self.gate_proj.forward(x.clone()));
         let up = self.up_proj.forward(x);
         self.down_proj.forward(gate.mul(up))
     }

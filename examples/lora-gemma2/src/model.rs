@@ -15,7 +15,9 @@ use burn::nn::{
     Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, RotaryEncoding,
     RotaryEncodingConfig,
 };
-use burn::tensor::{Int, Tensor, activation::gelu, activation::softmax, backend::Backend};
+use burn::tensor::{
+    Int, Tensor, activation::gelu_approximate, activation::softmax, backend::Backend,
+};
 
 use crate::types::Gemma2Config;
 
@@ -213,7 +215,7 @@ impl<B: Backend> Gemma2MLP<B> {
 
     /// Forward pass: `[batch, seq, hidden] -> [batch, seq, hidden]`.
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
-        let gate = gelu(self.gate_proj.forward(x.clone()));
+        let gate = gelu_approximate(self.gate_proj.forward(x.clone()));
         let up = self.up_proj.forward(x);
         self.down_proj.forward(gate.mul(up))
     }

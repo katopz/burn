@@ -425,6 +425,30 @@ pub fn load_gemma2_weights<B: Backend>(
     load_gemma2_weights_dtype(model, path, device, DType::F32)
 }
 
+/// Fix RMSNorm gamma values for Gemma 2 weight compatibility.
+///
+/// Gemma 2's HuggingFace implementation stores RMSNorm weights as offsets
+/// from 1.0 (i.e., `weight = gamma - 1.0`) and applies them as `(1.0 + weight)`.
+/// Burn's `RmsNorm` expects absolute gamma values and applies `x * gamma`.
+///
+/// This function adds 1.0 to all loaded gamma values to convert from
+/// HuggingFace's offset format to burn's absolute format.
+fn fix_rmsnorm_gemma2_offset<B: Backend>(model: &mut Gemma2Model<B>) {
+    let fix = |norm: &mut burn::nn::RmsNorm<B>| {
+        let gamma = norm.gamma.val().clone().add_scalar(1.0);
+        norm.gamma = burn::module::Param::from_tensor(gamma);
+    };
+
+    for layer in &mut model.layers {
+        fix(&mut layer.input_layernorm);
+        fix(&mut layer.post_attention_layernorm);
+        fix(&mut layer.pre_feedforward_layernorm);
+        fix(&mut layer.post_feedforward_layernorm);
+    }
+
+    fix(&mut model.norm);
+}
+
 /// Load Gemma 2 weights with explicit target dtype.
 ///
 /// Use `DType::F32` for NdArray (CPU) and `DType::F16` for Metal/WGPU.
@@ -508,6 +532,14 @@ pub fn load_gemma2_weights_dtype<B: Backend>(
              The embedding layer will use random initialization."
         );
     }
+
+    // Fix RMSNorm gamma values: Gemma 2 stores (gamma - 1.0) in safetensors,
+    // but burn's RmsNorm expects absolute gamma values.
+    let gamma_count = model.layers.len() * 4 + 1; // 4 norms per layer + final norm
+    fix_rmsnorm_gemma2_offset(model);
+    log::info!(
+        "Fixed {gamma_count} RMSNorm gamma values: added 1.0 to convert from Gemma 2 offset format"
+    );
 
     let _ = device; // device used implicitly by load_from
 
@@ -835,5 +867,93 @@ mod tests {
             &device,
         );
         assert!(matches!(result, Err(LoadError::FileNotFound(_))));
+    }
+
+    // -----------------------------------------------------------------------
+    // RMSNorm Offset Fix Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fix_rmsnorm_gemma2_offset_adds_one() {
+        type B = burn_ndarray::NdArray;
+        let device = Default::default();
+        let config = crate::types::Gemma2Config::gemma2_2b();
+        let mut model = Gemma2Model::<B>::new(&config, &device);
+
+        // Simulate HF-loaded gamma values near 0.0 (offsets from 1.0)
+        // by setting all norm gammas to a known small value.
+        let hf_gamma_val = 0.15; // typical HF offset value
+        let set_gamma = |norm: &mut burn::nn::RmsNorm<B>| {
+            let [d] = norm.gamma.shape().dims();
+            let tensor = burn::tensor::Tensor::<B, 1>::full([d], hf_gamma_val, &device);
+            norm.gamma = burn::module::Param::from_tensor(tensor);
+        };
+
+        for layer in &mut model.layers {
+            set_gamma(&mut layer.input_layernorm);
+            set_gamma(&mut layer.post_attention_layernorm);
+            set_gamma(&mut layer.pre_feedforward_layernorm);
+            set_gamma(&mut layer.post_feedforward_layernorm);
+        }
+        set_gamma(&mut model.norm);
+
+        // Apply the fix
+        fix_rmsnorm_gemma2_offset(&mut model);
+
+        // Verify all gamma values are now hf_gamma_val + 1.0
+        let expected = hf_gamma_val + 1.0;
+        let check_gamma = |norm: &burn::nn::RmsNorm<B>, name: &str| {
+            let data: Vec<f32> = norm.gamma.val().to_data().to_vec().unwrap();
+            for (i, &v) in data.iter().enumerate() {
+                assert!(
+                    (v - expected).abs() < 1e-5,
+                    "{name}[{i}] = {v}, expected {expected}"
+                );
+            }
+        };
+
+        for (i, layer) in model.layers.iter().enumerate() {
+            check_gamma(
+                &layer.input_layernorm,
+                &format!("layers.{i}.input_layernorm.gamma"),
+            );
+            check_gamma(
+                &layer.post_attention_layernorm,
+                &format!("layers.{i}.post_attention_layernorm.gamma"),
+            );
+            check_gamma(
+                &layer.pre_feedforward_layernorm,
+                &format!("layers.{i}.pre_feedforward_layernorm.gamma"),
+            );
+            check_gamma(
+                &layer.post_feedforward_layernorm,
+                &format!("layers.{i}.post_feedforward_layernorm.gamma"),
+            );
+        }
+        check_gamma(&model.norm, "norm.gamma");
+    }
+
+    #[test]
+    fn test_fix_rmsnorm_gamma_values_after_init() {
+        type B = burn_ndarray::NdArray;
+        let device = Default::default();
+        let config = crate::types::Gemma2Config::gemma2_2b();
+        let mut model = Gemma2Model::<B>::new(&config, &device);
+
+        // After init, gamma = ones (1.0). After fix, gamma should be 2.0.
+        fix_rmsnorm_gemma2_offset(&mut model);
+
+        // Verify the fix was applied (1.0 + 1.0 = 2.0 for freshly initialized model)
+        let data: Vec<f32> = model.norm.gamma.val().to_data().to_vec().unwrap();
+        for (i, &v) in data.iter().enumerate() {
+            assert!(
+                (v - 2.0).abs() < 1e-5,
+                "norm.gamma[{i}] = {v}, expected 2.0 (1.0 init + 1.0 fix)"
+            );
+        }
+
+        // Note: is_require_grad() returns false on NdArray (non-autodiff) backend.
+        // Gradient tracking is handled by the Autodiff wrapper in actual training.
+        // Param::from_tensor() does call require_grad(), but it's a no-op on non-AD backends.
     }
 }

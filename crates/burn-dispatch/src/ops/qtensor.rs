@@ -98,6 +98,11 @@ impl QTensorOps<Self> for Dispatch {
     }
 
     fn q_matmul(lhs: TensorPrimitive<Self>, rhs: TensorPrimitive<Self>) -> TensorPrimitive<Self> {
+        // NOTE: When one operand is autodiff-tracked (Float in Autodiff wrapper) and the
+        // other is QFloat, the Dispatch binary_op! macro cannot handle the mixed dispatch.
+        // The production path (sft-train) uses Autodiff<Metal<f16>> directly, bypassing
+        // Dispatch entirely — see burn-autodiff/src/ops/qtensor.rs for the implementation.
+        //
         // TODO: this would be much cleaner if we consolidated tensor primitive types
         match (lhs, rhs) {
             (TensorPrimitive::QFloat(lhs), TensorPrimitive::QFloat(rhs)) => {

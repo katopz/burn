@@ -40,7 +40,7 @@ use burn::nn::{Embedding, Linear, RmsNorm, RotaryEncoding};
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder, RecorderError};
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::{
-    Int, Tensor,
+    ElementConversion, Int, Tensor,
     activation::{gelu_approximate, log_softmax, softmax},
     backend::Backend,
 };
@@ -730,7 +730,12 @@ impl<B: AutodiffBackend> TrainStep for Gemma2ForSFT<B> {
         let ntokens = Tensor::<B, 2>::ones([batch_size, seq_len], &logits.device())
             .mask_fill(batch.mask_pad, 0)
             .sum();
-        let loss = masked_ce.sum() / ntokens;
+        let loss = masked_ce.sum() / ntokens.clone();
+
+        // Log loss for monitoring (materialize scalar from GPU)
+        let loss_val: f32 = loss.clone().into_scalar().elem();
+        let ntokens_val: f32 = ntokens.into_scalar().elem();
+        log::info!("Train loss: {loss_val:.4} (ntokens={ntokens_val:.0})");
 
         TrainOutput::new(
             self,
@@ -761,6 +766,10 @@ impl<B: Backend> InferenceStep for Gemma2ForSFT<B> {
             .mask_fill(batch.mask_pad, 0)
             .sum();
         let loss = masked_ce.sum() / ntokens;
+
+        // Log val loss for monitoring
+        let loss_val: f32 = loss.clone().into_scalar().elem();
+        log::info!("Val loss: {loss_val:.4}");
 
         SequenceOutput::new(loss, logits, None, targets)
     }

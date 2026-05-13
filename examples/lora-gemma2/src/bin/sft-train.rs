@@ -717,9 +717,19 @@ fn main() {
     use burn::backend::{Autodiff, Metal};
     use burn::tensor::f16;
 
-    // Use f16 on Metal to halve memory (~16GB vs ~32GB for Gemma 4 E4B).
-    // Metal does not support BF16, so BF16 weights are converted to F16 during loading.
-    type Backend = Metal<f16, i64>;
+    // Use f16 on Metal to halve memory and maximize Metal Performance Shaders throughput.
+    //
+    // NOTE: f16 training has a known instability — loss spikes at ~iter 9 (14-16 range)
+    // before slowly recovering. Root cause: burn does NOT do mixed precision like MLX does.
+    // MLX internally upcasts to f32 for critical ops (RMSNorm variance, softmax, grad accum)
+    // while keeping weights in f16. Burn's metal backend uses pure f16 everywhere.
+    //
+    // This is a burn upstream limitation, not a fixable issue in this project.
+    // See Plan 014 benchmarks for details: metal/f16 = ~3-4s/iter, metal/f32 = ~22s/iter.
+    //
+    // If training quality matters more than speed, switch to f32:
+    //   type Backend = Metal<f32, i64>;  // ~22s/iter, stable loss
+    type Backend = Metal<f16, i64>; // ~3-4s/iter, loss spikes but 5x faster
     type AD = Autodiff<Backend>;
 
     let args = SftArgs::parse();

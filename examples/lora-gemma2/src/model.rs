@@ -16,7 +16,7 @@ use burn::nn::{
     RotaryEncodingConfig,
 };
 use burn::tensor::{
-    Int, Tensor, activation::gelu_approximate, activation::softmax, backend::Backend,
+    FloatDType, Int, Tensor, activation::gelu_approximate, activation::softmax, backend::Backend,
 };
 
 use crate::types::Gemma2Config;
@@ -39,6 +39,27 @@ fn causal_mask<B: Backend>(seq_len: usize, device: &B::Device) -> Tensor<B, 2> {
     // Start with zeros, fill future positions with -inf
     Tensor::<B, 2>::zeros([seq_len, seq_len], device)
         .mask_fill(attend.equal_elem(false), f32::NEG_INFINITY)
+}
+
+/// Mixed-precision RMSNorm: upcast input to f32 for numerically stable normalization.
+///
+/// Computes the full RMSNorm (variance, normalization, gamma scaling) in f32,
+/// then casts the result back to the original dtype. This prevents loss spikes
+/// when training with f16 weights on Metal/Apple Silicon.
+///
+/// Unlike burn's default `RmsNorm::forward()` which only upcasts the variance,
+/// this upcasts the entire computation including the division and gamma scaling.
+fn rms_norm_f32<B: Backend, const D: usize>(norm: &RmsNorm<B>, x: Tensor<B, D>) -> Tensor<B, D> {
+    let original_dtype = x.dtype();
+    // Upcast to f32 for stable computation
+    let x_f32 = x.cast(FloatDType::F32);
+    // RMSNorm in f32: x / sqrt(mean(x^2) + eps) * gamma
+    let rms = (x_f32.clone().square().mean_dim(D - 1) + norm.epsilon).sqrt();
+    let normalized = x_f32 / rms;
+    let gamma_f32 = norm.gamma.val().cast(FloatDType::F32).unsqueeze();
+    let output_f32 = normalized * gamma_f32;
+    // Cast back to original dtype
+    output_f32.cast(original_dtype)
 }
 
 // ---------------------------------------------------------------------------
@@ -151,23 +172,27 @@ impl<B: Backend> Gemma2Attention<B> {
         // Attention scores: Q @ K^T -> [batch, heads, seq, seq]
         let scores = q.matmul(k.swap_dims(2, 3));
 
+        // Mixed precision: cast to f32 for stable softcapping and softmax
+        let original_dtype = scores.dtype();
+        let scores = scores.cast(FloatDType::F32);
+
         // Softcapping: tanh(scores / cap) * cap
         let scores = scores
             .div_scalar(self.softcap)
             .tanh()
             .mul_scalar(self.softcap);
 
-        // Apply causal mask
+        // Apply causal mask (also in f32)
         let scores = match mask_add {
             Some(m) => {
-                let m4 = m.reshape([1, 1, seq, seq]); // broadcast over batch + heads
+                let m4 = m.reshape([1, 1, seq, seq]).cast(FloatDType::F32);
                 scores.add(m4)
             }
             None => scores,
         };
 
-        // Softmax over keys (dim 3)
-        let weights = softmax(scores, 3);
+        // Softmax over keys (dim 3) — computed in f32 for stability
+        let weights = softmax(scores, 3).cast(original_dtype);
 
         // Weighted sum: weights @ V -> [batch, heads, seq, head_dim]
         let output = weights.matmul(v);
@@ -260,17 +285,17 @@ impl<B: Backend> Gemma2Block<B> {
 
     /// Forward pass: `[batch, seq, hidden] -> [batch, seq, hidden]`.
     pub fn forward(&self, x: Tensor<B, 3>, mask: Option<Tensor<B, 2>>) -> Tensor<B, 3> {
-        // Attention with sandwich norm
+        // Attention with sandwich norm (mixed precision for stability)
         let r = self
             .self_attn
-            .forward(self.input_layernorm.forward(x.clone()), mask);
-        let h = x.clone() + self.post_attention_layernorm.forward(r);
+            .forward(rms_norm_f32(&self.input_layernorm, x.clone()), mask);
+        let h = x.clone() + rms_norm_f32(&self.post_attention_layernorm, r);
 
-        // MLP with sandwich norm
+        // MLP with sandwich norm (mixed precision for stability)
         let r = self
             .mlp
-            .forward(self.pre_feedforward_layernorm.forward(h.clone()));
-        h + self.post_feedforward_layernorm.forward(r)
+            .forward(rms_norm_f32(&self.pre_feedforward_layernorm, h.clone()));
+        h + rms_norm_f32(&self.post_feedforward_layernorm, r)
     }
 }
 
@@ -340,17 +365,20 @@ impl<B: Backend> Gemma2Model<B> {
             h = layer.forward(h, Some(mask.clone()));
         }
 
-        // Final norm
-        let h = self.norm.forward(h);
+        // Final norm (mixed precision for stability)
+        let h = rms_norm_f32(&self.norm, h);
 
         // LM head: [batch, seq, hidden] -> [batch, seq, vocab]
         let logits = self.lm_head.forward(h);
 
-        // Final logit softcapping: tanh(logits / cap) * cap
+        // Final logit softcapping in f32: tanh(logits / cap) * cap
+        let original_dtype = logits.dtype();
         logits
+            .cast(FloatDType::F32)
             .div_scalar(self.final_logit_softcapping)
             .tanh()
             .mul_scalar(self.final_logit_softcapping)
+            .cast(original_dtype)
     }
 
     /// Forward pass returning hidden states (before LM head).
@@ -372,16 +400,21 @@ impl<B: Backend> Gemma2Model<B> {
             h = layer.forward(h, Some(mask.clone()));
         }
 
-        self.norm.forward(h)
+        // Final norm (mixed precision for stability)
+        rms_norm_f32(&self.norm, h)
     }
 
-    /// Compute logits from hidden states (after LM head + softcapping).
+    /// Compute logits from hidden states (after LM head + softcapping in f32).
     pub fn hidden_to_logits(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
         let logits = self.lm_head.forward(hidden);
+        // Softcapping in f32 for numerical stability
+        let original_dtype = logits.dtype();
         logits
+            .cast(FloatDType::F32)
             .div_scalar(self.final_logit_softcapping)
             .tanh()
             .mul_scalar(self.final_logit_softcapping)
+            .cast(original_dtype)
     }
 }
 

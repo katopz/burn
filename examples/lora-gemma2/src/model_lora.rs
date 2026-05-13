@@ -40,7 +40,7 @@ use burn::nn::{Embedding, Linear, RmsNorm, RotaryEncoding};
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder, RecorderError};
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::{
-    ElementConversion, Int, Tensor,
+    ElementConversion, FloatDType, Int, Tensor,
     activation::{gelu_approximate, log_softmax, softmax},
     backend::Backend,
 };
@@ -65,6 +65,27 @@ fn causal_mask<B: Backend>(seq_len: usize, device: &B::Device) -> Tensor<B, 2> {
     let attend = col.lower_equal(row);
     Tensor::<B, 2>::zeros([seq_len, seq_len], device)
         .mask_fill(attend.equal_elem(false), f32::NEG_INFINITY)
+}
+
+/// Mixed-precision RMSNorm: upcast input to f32 for numerically stable normalization.
+///
+/// Computes the full RMSNorm (variance, normalization, gamma scaling) in f32,
+/// then casts the result back to the original dtype. This prevents loss spikes
+/// when training with f16 weights on Metal/Apple Silicon.
+///
+/// Unlike burn's default `RmsNorm::forward()` which only upcasts the variance,
+/// this upcasts the entire computation including the division and gamma scaling.
+fn rms_norm_f32<B: Backend, const D: usize>(norm: &RmsNorm<B>, x: Tensor<B, D>) -> Tensor<B, D> {
+    let original_dtype = x.dtype();
+    // Upcast to f32 for stable computation
+    let x_f32 = x.cast(FloatDType::F32);
+    // RMSNorm in f32: x / sqrt(mean(x^2) + eps) * gamma
+    let rms = (x_f32.clone().square().mean_dim(D - 1) + norm.epsilon).sqrt();
+    let normalized = x_f32 / rms;
+    let gamma_f32 = norm.gamma.val().cast(FloatDType::F32).unsqueeze();
+    let output_f32 = normalized * gamma_f32;
+    // Cast back to original dtype
+    output_f32.cast(original_dtype)
 }
 
 // ---------------------------------------------------------------------------
@@ -137,23 +158,27 @@ impl<B: Backend> Gemma2AttentionLora<B> {
         // Attention scores: Q @ K^T -> [batch, heads, seq, seq]
         let scores = q.matmul(k.swap_dims(2, 3));
 
+        // Mixed precision: cast to f32 for stable softcapping and softmax
+        let original_dtype = scores.dtype();
+        let scores = scores.cast(FloatDType::F32);
+
         // Softcapping: tanh(scores / cap) * cap
         let scores = scores
             .div_scalar(self.softcap)
             .tanh()
             .mul_scalar(self.softcap);
 
-        // Apply causal mask
+        // Apply causal mask (also in f32)
         let scores = match mask_add {
             Some(m) => {
-                let m4 = m.reshape([1, 1, seq, seq]);
+                let m4 = m.reshape([1, 1, seq, seq]).cast(FloatDType::F32);
                 scores.add(m4)
             }
             None => scores,
         };
 
-        // Softmax over keys (dim 3)
-        let weights = softmax(scores, 3);
+        // Softmax over keys (dim 3) — computed in f32 for stability
+        let weights = softmax(scores, 3).cast(original_dtype);
 
         // Weighted sum: weights @ V -> [batch, heads, seq, head_dim]
         let output = weights.matmul(v);
@@ -211,17 +236,17 @@ pub struct Gemma2BlockLora<B: Backend> {
 impl<B: Backend> Gemma2BlockLora<B> {
     /// Forward pass: `[batch, seq, hidden] -> [batch, seq, hidden]`.
     pub fn forward(&self, x: Tensor<B, 3>, mask: Option<Tensor<B, 2>>) -> Tensor<B, 3> {
-        // Attention with sandwich norm
+        // Attention with sandwich norm (mixed precision for stability)
         let r = self
             .self_attn
-            .forward(self.input_layernorm.forward(x.clone()), mask);
-        let h = x.clone() + self.post_attention_layernorm.forward(r);
+            .forward(rms_norm_f32(&self.input_layernorm, x.clone()), mask);
+        let h = x.clone() + rms_norm_f32(&self.post_attention_layernorm, r);
 
-        // MLP with sandwich norm
+        // MLP with sandwich norm (mixed precision for stability)
         let r = self
             .mlp
-            .forward(self.pre_feedforward_layernorm.forward(h.clone()));
-        h + self.post_feedforward_layernorm.forward(r)
+            .forward(rms_norm_f32(&self.pre_feedforward_layernorm, h.clone()));
+        h + rms_norm_f32(&self.post_feedforward_layernorm, r)
     }
 }
 
@@ -267,14 +292,18 @@ impl<B: Backend> Gemma2ModelLora<B> {
             h = layer.forward(h, Some(mask.clone()));
         }
 
-        // Final norm + LM head + softcapping
-        let h = self.norm.forward(h);
+        // Final norm (mixed precision for stability) + LM head + softcapping
+        let h = rms_norm_f32(&self.norm, h);
         let logits = self.lm_head.forward(h);
 
+        // Softcapping in f32 for numerical stability
+        let original_dtype = logits.dtype();
         logits
+            .cast(FloatDType::F32)
             .div_scalar(self.final_logit_softcapping)
             .tanh()
             .mul_scalar(self.final_logit_softcapping)
+            .cast(original_dtype)
     }
 
     /// Merge all LoRA weights into base layers for inference.
@@ -716,8 +745,14 @@ impl<B: AutodiffBackend> TrainStep for Gemma2ForSFT<B> {
         // Token-normalized cross-entropy loss (matches Python's sft_loss approach):
         //   loss = sum(CE_per_token * non_pad_mask) / num_non_pad_tokens
         // Python ref: unsloth-mlx losses.py sft_loss() — masked_ce.sum() / ntoks
+        //
+        // Mixed precision: cast logits to f32 for numerically stable log_softmax.
+        // f16 log_softmax causes loss spikes on Metal due to limited precision in
+        // the exp/sum/log operations.
         let [batch_size, seq_len, _vocab_size] = logits.dims();
-        let log_probs = log_softmax(logits.clone(), 2); // [batch, seq, vocab]
+        let device = logits.device();
+        let logits_f32 = logits.clone().cast(FloatDType::F32);
+        let log_probs = log_softmax(logits_f32, 2); // [batch, seq, vocab]
         let target_indices = targets.clone().reshape([batch_size, seq_len, 1]);
         let token_log_probs = log_probs
             .gather(2, target_indices)
@@ -727,7 +762,9 @@ impl<B: AutodiffBackend> TrainStep for Gemma2ForSFT<B> {
         let masked_ce = token_log_probs.neg().mask_fill(batch.mask_pad.clone(), 0);
 
         // Normalize by actual non-padding token count (not batch*seq_len)
-        let ntokens = Tensor::<B, 2>::ones([batch_size, seq_len], &logits.device())
+        // Keep in f32 to match masked_ce dtype (DTypeMismatch if mixed with f16)
+        let ntokens = Tensor::<B, 2>::ones([batch_size, seq_len], &device)
+            .cast(FloatDType::F32)
             .mask_fill(batch.mask_pad, 0)
             .sum();
         let loss = masked_ce.sum() / ntokens.clone();

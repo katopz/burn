@@ -39,6 +39,9 @@
 //! | `--val-split` | `0.1` | Validation split ratio |
 //! | `--seed` | `42` | Random seed |
 //! | `--quantize` | `none` | Quantize frozen weights: `none`, `q4s`, `q8s` |
+//! | `--grad-accum` | `8` | Gradient accumulation steps (effective batch = batch × accum) |
+//! | `--max-grad-norm` | `1.0` | Max gradient norm for clipping (0 = disabled) |
+//! | `--weight-decay` | `0.01` | Adam weight decay (L2 regularization) |
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,6 +50,9 @@ use burn::data::dataloader::DataLoaderBuilder;
 use burn::module::{AutodiffModule, Module, Quantizer};
 use burn::nn::lora::{LoraBias, LoraConfig};
 use burn::optim::AdamConfig;
+use burn::optim::decay::WeightDecayConfig;
+use burn::optim::grad_clipping::GradientClippingConfig;
+use burn::optim::lr_scheduler::cosine::CosineAnnealingLrSchedulerConfig;
 use burn::record::CompactRecorder;
 use burn::tensor::Element;
 use burn::tensor::backend::AutodiffBackend;
@@ -98,6 +104,12 @@ struct SftArgs {
     tokenizer: Option<String>,
     /// Quantization scheme for frozen weights: none, q4s, q8s (default: none).
     quantize: String,
+    /// Gradient accumulation steps (effective batch = batch_size × grad_accum).
+    grad_accum: usize,
+    /// Max gradient norm for clipping (0 = disabled).
+    max_grad_norm: f32,
+    /// Adam weight decay (L2 regularization).
+    weight_decay: f32,
 }
 
 impl SftArgs {
@@ -118,6 +130,9 @@ impl SftArgs {
             seed: 42,
             tokenizer: None,
             quantize: "none".into(),
+            grad_accum: 8,
+            max_grad_norm: 1.0,
+            weight_decay: 0.01,
         };
 
         let cli: Vec<String> = std::env::args().collect();
@@ -223,6 +238,30 @@ impl SftArgs {
                     args.quantize = cli.get(i + 1).expect("--quantize requires a value").clone();
                     i += 2;
                 }
+                "--grad-accum" => {
+                    args.grad_accum = cli
+                        .get(i + 1)
+                        .expect("--grad-accum requires a value")
+                        .parse()
+                        .expect("invalid grad-accum");
+                    i += 2;
+                }
+                "--max-grad-norm" => {
+                    args.max_grad_norm = cli
+                        .get(i + 1)
+                        .expect("--max-grad-norm requires a value")
+                        .parse()
+                        .expect("invalid max-grad-norm");
+                    i += 2;
+                }
+                "--weight-decay" => {
+                    args.weight_decay = cli
+                        .get(i + 1)
+                        .expect("--weight-decay requires a value")
+                        .parse()
+                        .expect("invalid weight-decay");
+                    i += 2;
+                }
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -289,6 +328,9 @@ fn print_usage() {
     eprintln!("  --val-split <F>          Validation split ratio (default: 0.1)");
     eprintln!("  --seed <N>               Random seed (default: 42)");
     eprintln!("  --quantize <SCHEME>      Quantize frozen weights: none, q4s, q8s (default: none)");
+    eprintln!("  --grad-accum <N>         Gradient accumulation steps (default: 8)");
+    eprintln!("  --max-grad-norm <F>      Max gradient norm for clipping, 0=off (default: 1.0)");
+    eprintln!("  --weight-decay <F>       Adam weight decay / L2 reg (default: 0.01)");
 }
 
 // ---------------------------------------------------------------------------
@@ -360,9 +402,10 @@ fn run<B: AutodiffBackend>(args: SftArgs, device: B::Device) {
     // 3. Split Dataset
     // -----------------------------------------------------------------------
     let (train_dataset, val_dataset) = dataset.split(1.0_f32 - args.val_split as f32);
+    let train_samples = train_dataset.len();
     log::info!(
         "  Split: {} train, {} val ({:.0}% val split)",
-        train_dataset.len(),
+        train_samples,
         val_dataset.len(),
         args.val_split * 100.0
     );
@@ -519,8 +562,23 @@ fn run<B: AutodiffBackend>(args: SftArgs, device: B::Device) {
     log::info!("[7/8] Setting up training");
     log::info!("  Epochs: {}", args.epochs);
     log::info!("  Batch size: {}", args.batch_size);
-    log::info!("  Learning rate: {}", args.learning_rate);
-    log::info!("  Optimizer: Adam");
+
+    // Compute total iterations for cosine LR schedule (train_samples saved before dataloader move)
+    let steps_per_epoch = train_samples.div_ceil(args.batch_size);
+    let total_steps = steps_per_epoch * args.epochs;
+    let effective_lr = args.learning_rate.min(1.0);
+
+    log::info!(
+        "  Learning rate: {:.6} (cosine schedule, {total_steps} steps)",
+        effective_lr
+    );
+    log::info!("  Optimizer: Adam (weight_decay={})", args.weight_decay);
+    log::info!(
+        "  Gradient accumulation: {} (effective batch={})",
+        args.grad_accum,
+        args.batch_size * args.grad_accum
+    );
+    log::info!("  Gradient clipping: max_norm={}", args.max_grad_norm);
 
     // Create output directory
     std::fs::create_dir_all(&args.output_dir)
@@ -529,21 +587,57 @@ fn run<B: AutodiffBackend>(args: SftArgs, device: B::Device) {
     // Seed the backend
     B::seed(&device, args.seed);
 
-    let optimizer = AdamConfig::new().init();
+    let mut adam_config = AdamConfig::new();
 
-    let training = SupervisedTraining::new(&args.output_dir, dataloader_train, dataloader_valid)
-        .metric_train_numeric(LossMetric::new())
-        .metric_valid_numeric(LossMetric::new())
-        .num_epochs(args.epochs)
-        .with_file_checkpointer(CompactRecorder::new())
-        .summary();
+    // Wire weight decay (L2 regularization)
+    if args.weight_decay > 0.0 {
+        adam_config =
+            adam_config.with_weight_decay(Some(WeightDecayConfig::new(args.weight_decay)));
+    }
+
+    // Wire gradient clipping (prevents NaN with rank=16)
+    if args.max_grad_norm > 0.0 {
+        adam_config =
+            adam_config.with_grad_clipping(Some(GradientClippingConfig::Norm(args.max_grad_norm)));
+    }
+
+    let optimizer = adam_config.init();
+
+    let mut training =
+        SupervisedTraining::new(&args.output_dir, dataloader_train, dataloader_valid)
+            .metric_train_numeric(LossMetric::new())
+            .metric_valid_numeric(LossMetric::new())
+            .num_epochs(args.epochs)
+            .with_file_checkpointer(CompactRecorder::new());
+
+    // Wire gradient accumulation (effective batch = batch_size × grad_accum)
+    if args.grad_accum > 1 {
+        training = training.grads_accumulation(args.grad_accum);
+    }
+
+    let training = training.summary();
 
     // -----------------------------------------------------------------------
     // 9. Run Training
     // -----------------------------------------------------------------------
     log::info!("[8/8] Starting training...\n");
 
-    let learner = Learner::new(sft_model, optimizer, args.learning_rate);
+    // Cosine annealing LR schedule: decays from lr to near-zero over all training steps
+    let lr_scheduler = CosineAnnealingLrSchedulerConfig::new(effective_lr, total_steps)
+        .with_min_lr(effective_lr * 0.1)
+        .init()
+        .expect("Invalid LR scheduler config");
+
+    log::info!(
+        "  LR schedule: cosine (initial={effective_lr:.6}, min={:.6}, steps={total_steps})",
+        effective_lr * 0.1,
+    );
+    log::info!(
+        "  Total iterations: {total_steps} ({steps_per_epoch}/epoch × {} epochs)",
+        args.epochs
+    );
+
+    let learner = Learner::new(sft_model, optimizer, lr_scheduler);
     let result = training.launch(learner);
 
     log::info!("\n=== Training Complete ===\n");

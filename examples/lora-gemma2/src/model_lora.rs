@@ -769,10 +769,9 @@ impl<B: AutodiffBackend> TrainStep for Gemma2ForSFT<B> {
             .sum();
         let loss = masked_ce.sum() / ntokens.clone();
 
-        // Log loss for monitoring (materialize scalar from GPU)
-        let loss_val: f32 = loss.clone().into_scalar().elem();
-        let ntokens_val: f32 = ntokens.into_scalar().elem();
-        log::info!("Train loss: {loss_val:.4} (ntokens={ntokens_val:.0})");
+        // NOTE: Do NOT call loss.into_scalar() here — it forces a GPU sync
+        // that costs ~800ms per iteration (17% overhead). The loss value is
+        // tracked via burn's learner metrics (SequenceOutput.loss) instead.
 
         TrainOutput::new(
             self,

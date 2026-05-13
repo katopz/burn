@@ -17,17 +17,20 @@ ndarray-blas-netlib = ["burn/ndarray", "burn/blas-netlib", "dep:burn-ndarray"]
 ndarray-blas-openblas = ["burn/ndarray", "burn/openblas", "dep:burn-ndarray"]
 tch-cpu = ["burn/tch"]
 tch-gpu = ["burn/tch"]
-wgpu = ["burn/wgpu"]
-cuda = ["burn/cuda", "burn/default"]
-metal = ["burn/metal", "burn/default"]
-vulkan = ["burn/vulkan", "burn/default"]
-rocm = ["burn/rocm", "burn/default"]
+metal = ["burn/metal", "burn/default", "cubecl/metal"]
+wgpu = ["burn/wgpu", "cubecl/wgpu"]
+cuda = ["burn/cuda", "burn/default", "cubecl/cuda"]
+vulkan = ["burn/vulkan", "burn/default", "cubecl/vulkan"]
+rocm = ["burn/rocm", "burn/default", "cubecl/rocm"]
 remote = ["burn/remote", "burn/default"]
 
 [dependencies]
 burn = { path = "../../crates/burn", features = ["train", "tui"] }
+burn-backend = { path = "../../crates/burn-backend" }
+burn-cubecl = { path = "../../crates/burn-cubecl" }
 burn-ndarray = { path = "../../crates/burn-ndarray", optional = true }
 burn-store = { path = "../../crates/burn-store", features = ["std", "safetensors"] }
+cubecl = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true, features = ["std", "derive"] }

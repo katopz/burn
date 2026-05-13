@@ -5260,8 +5260,11 @@ name = "lora-gemma2"
 version = "0.22.0-pre.1"
 dependencies = [
  "burn",
+ "burn-backend",
+ "burn-cubecl",
  "burn-ndarray",
  "burn-store",
+ "cubecl",
  "env_logger",
  "log",
  "rand 0.10.1",

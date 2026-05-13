@@ -35,12 +35,14 @@ use std::path::PathBuf;
 
 use burn::module::{Content, DisplaySettings, Module, ModuleDisplay};
 use burn::nn::lora::{LoraAdaptable, LoraConfig, LoraLinear};
-use burn::nn::loss::CrossEntropyLossConfig;
+
 use burn::nn::{Embedding, Linear, RmsNorm, RotaryEncoding};
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder, RecorderError};
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::{
-    Int, Tensor, activation::gelu_approximate, activation::softmax, backend::Backend,
+    Int, Tensor,
+    activation::{gelu_approximate, log_softmax, softmax},
+    backend::Backend,
 };
 use burn::train::{InferenceStep, SequenceOutput, TrainOutput, TrainStep};
 
@@ -711,16 +713,24 @@ impl<B: AutodiffBackend> TrainStep for Gemma2ForSFT<B> {
         let logits = self.model.forward(batch.tokens_inputs);
         let targets = batch.targets;
 
-        // Flatten for cross-entropy: [batch*seq, vocab] and [batch*seq]
-        let [batch_size, seq_len, vocab_size] = logits.dims();
-        let flat_logits = logits.clone().reshape([batch_size * seq_len, vocab_size]);
-        let flat_targets = targets.clone().reshape([batch_size * seq_len]);
+        // Token-normalized cross-entropy loss (matches Python's sft_loss approach):
+        //   loss = sum(CE_per_token * non_pad_mask) / num_non_pad_tokens
+        // Python ref: unsloth-mlx losses.py sft_loss() — masked_ce.sum() / ntoks
+        let [batch_size, seq_len, _vocab_size] = logits.dims();
+        let log_probs = log_softmax(logits.clone(), 2); // [batch, seq, vocab]
+        let target_indices = targets.clone().reshape([batch_size, seq_len, 1]);
+        let token_log_probs = log_probs
+            .gather(2, target_indices)
+            .reshape([batch_size, seq_len]); // [batch, seq]
 
-        // Cross-entropy loss with pad tokens ignored
-        let loss = CrossEntropyLossConfig::new()
-            .with_pad_tokens(Some(vec![self.pad_token_id]))
-            .init(&logits.device())
-            .forward(flat_logits, flat_targets);
+        // Per-token CE, zero out padding positions (mask_pad: true = padding)
+        let masked_ce = token_log_probs.neg().mask_fill(batch.mask_pad.clone(), 0);
+
+        // Normalize by actual non-padding token count (not batch*seq_len)
+        let ntokens = Tensor::<B, 2>::ones([batch_size, seq_len], &logits.device())
+            .mask_fill(batch.mask_pad, 0)
+            .sum();
+        let loss = masked_ce.sum() / ntokens;
 
         TrainOutput::new(
             self,
@@ -738,14 +748,19 @@ impl<B: Backend> InferenceStep for Gemma2ForSFT<B> {
         let logits = self.model.forward(batch.tokens_inputs);
         let targets = batch.targets;
 
-        let [batch_size, seq_len, vocab_size] = logits.dims();
-        let flat_logits = logits.clone().reshape([batch_size * seq_len, vocab_size]);
-        let flat_targets = targets.clone().reshape([batch_size * seq_len]);
+        // Token-normalized cross-entropy (same formula as TrainStep)
+        let [batch_size, seq_len, _vocab_size] = logits.dims();
+        let log_probs = log_softmax(logits.clone(), 2);
+        let target_indices = targets.clone().reshape([batch_size, seq_len, 1]);
+        let token_log_probs = log_probs
+            .gather(2, target_indices)
+            .reshape([batch_size, seq_len]);
 
-        let loss = CrossEntropyLossConfig::new()
-            .with_pad_tokens(Some(vec![self.pad_token_id]))
-            .init(&logits.device())
-            .forward(flat_logits, flat_targets);
+        let masked_ce = token_log_probs.neg().mask_fill(batch.mask_pad.clone(), 0);
+        let ntokens = Tensor::<B, 2>::ones([batch_size, seq_len], &logits.device())
+            .mask_fill(batch.mask_pad, 0)
+            .sum();
+        let loss = masked_ce.sum() / ntokens;
 
         SequenceOutput::new(loss, logits, None, targets)
     }

@@ -8,28 +8,32 @@ use crate::{
     collections::HashMap,
     grads::Gradients,
     graph::{
-        NodeRef, StepBoxed,
+        StepBoxed,
         traversal::{BreadthFirstSearch, TraversalItem},
     },
     tensor::NodeRefCount,
 };
 use alloc::vec::Vec;
+#[cfg(feature = "distributed")]
 use burn_backend::tensor::FloatTensor;
 
 #[cfg(feature = "distributed")]
 use crate::distributed::{DistributedGradientRegistration, DistributedRegistration};
-#[cfg(not(feature = "distributed"))]
-use burn_backend::Backend;
+#[cfg(feature = "distributed")]
+use crate::graph::NodeRef;
 #[cfg(feature = "distributed")]
 use burn_backend::distributed::{DistributedBackend, DistributedParams};
 
-struct TapeResult {
-    tape: Vec<Vec<StepBoxed>>,
-    checkpointer: Checkpointer,
+/// Owned tape data produced by [`AutodiffServer::prepare_backward`], ready for
+/// lock-free execution via [`AutodiffServer::execute_steps`].
+pub(crate) struct PrepareBackwardResult {
+    pub(crate) tape: Vec<Vec<StepBoxed>>,
+    pub(crate) checkpointer: Checkpointer,
+    pub(crate) consumed: Vec<NodeId>,
     #[cfg(feature = "distributed")]
-    n_required_map: HashMap<NodeId, usize>,
+    pub(crate) n_required_map: HashMap<NodeId, usize>,
     #[cfg(feature = "distributed")]
-    distributed_params: HashMap<NodeId, DistributedParams>,
+    pub(crate) distributed_params: HashMap<NodeId, DistributedParams>,
 }
 
 #[derive(Default)]
@@ -64,31 +68,22 @@ impl AutodiffServer {
         self.actions_builder.insert(node_id, actions);
     }
 
+    /// Prepares backward pass by building the tape without executing steps.
+    ///
+    /// Returns owned tape data that can be processed without holding any graph lock.
+    /// Call [`cleanup_after_backward`] after executing steps to finalize cleanup.
     #[cfg(not(feature = "distributed"))]
-    pub fn backward<NC: NodeCleaner, B: Backend>(
-        &mut self,
-        root_node: NodeRef,
-        root_tensor: FloatTensor<B>,
-        node_id: NodeId,
-    ) -> Gradients {
+    pub(crate) fn prepare_backward(&mut self, node_id: NodeId) -> PrepareBackwardResult {
         let step = self.steps.remove(&node_id).expect(
             "Node should have a step registered, did you forget to call \
              `Tensor::register_grad` on the tensor where you need gradients?",
         );
         let builder = self.actions_builder.remove(&node_id).unwrap();
 
-        let mut consumed = Vec::new();
-        let tape_result = self.build_tape(node_id, step, builder, &mut consumed);
-
-        let grads = Gradients::new::<B>(root_node.clone(), root_tensor);
-        let gradients = Self::execute_steps(tape_result.tape, grads, tape_result.checkpointer);
-
-        self.cleanup::<NC>(&consumed);
-
-        gradients
+        self.build_tape(node_id, step, builder)
     }
 
-    fn cleanup<NC: NodeCleaner>(&mut self, consumed: &Vec<NodeId>) {
+    pub(crate) fn cleanup_after_backward<NC: NodeCleaner>(&mut self, consumed: Vec<NodeId>) {
         let mut cleaner = NC::init();
         self.memory_management
             .free_unavailable_nodes(|node_id: &NodeId| {
@@ -96,7 +91,7 @@ impl AutodiffServer {
                 self.actions_builder.remove(node_id);
                 NC::clean(&mut cleaner, node_id);
             });
-        for node_id in consumed {
+        for node_id in &consumed {
             cleaner.clean(node_id)
         }
     }
@@ -114,8 +109,8 @@ impl AutodiffServer {
         node: NodeId,
         node_step: StepBoxed,
         mut builder: CheckpointerBuilder,
-        consumed: &mut Vec<NodeId>,
-    ) -> TapeResult {
+    ) -> PrepareBackwardResult {
+        let mut consumed = Vec::new();
         let mut tape = (0..node_step.depth() + 1)
             .map(|_| Vec::with_capacity(1))
             .collect::<Vec<_>>();
@@ -161,9 +156,10 @@ impl AutodiffServer {
 
         let checkpointer = builder.build(NodeTree::new(tree));
 
-        TapeResult {
+        PrepareBackwardResult {
             tape,
             checkpointer,
+            consumed,
             #[cfg(feature = "distributed")]
             n_required_map,
             #[cfg(feature = "distributed")]
@@ -171,7 +167,7 @@ impl AutodiffServer {
         }
     }
 
-    fn execute_steps(
+    pub(crate) fn execute_steps(
         tape: Vec<Vec<StepBoxed>>,
         mut grads: Gradients,
         mut checkpointer: Checkpointer,
@@ -193,34 +189,26 @@ impl AutodiffServer {
         self.memory_management.maybe_useful()
     }
 
+    /// Prepares backward pass by building the tape without executing steps.
+    ///
+    /// Returns owned tape data that can be processed without holding any graph lock.
+    /// Call [`cleanup_after_backward`] after computing gradients to finalize cleanup.
     #[cfg(feature = "distributed")]
-    pub fn backward<NC: NodeCleaner, B: DistributedBackend>(
-        &mut self,
-        root_node: NodeRef,
-        root_tensor: FloatTensor<B>,
-        node_id: NodeId,
-    ) -> Gradients {
+    pub(crate) fn prepare_backward(&mut self, node_id: NodeId) -> PrepareBackwardResult {
         let step = self.steps.remove(&node_id).expect(
             "Node should have a step registered, did you forget to call \
              `Tensor::register_grad` on the tensor where you need gradients?",
         );
         let builder = self.actions_builder.remove(&node_id).unwrap();
 
-        let mut consumed = Vec::new();
-        let tape_result = self.build_tape(node_id, step, builder, &mut consumed);
-
-        let gradients = self.compute_gradients::<B>(root_node, root_tensor, tape_result);
-        self.cleanup::<NC>(&consumed);
-
-        gradients
+        self.build_tape(node_id, step, builder)
     }
 
     #[cfg(feature = "distributed")]
-    fn compute_gradients<B: DistributedBackend>(
-        &mut self,
+    pub(crate) fn compute_gradients<B: DistributedBackend>(
         root_node: NodeRef,
         root_tensor: FloatTensor<B>,
-        tape_result: TapeResult,
+        tape_result: PrepareBackwardResult,
     ) -> Gradients {
         let device = &B::float_device(&root_tensor);
 

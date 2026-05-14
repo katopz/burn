@@ -115,12 +115,23 @@ impl AutodiffClient for GraphMutexClient {
         let node_id = root.node.id;
         let graph = GraphMutexClient::graph(root.node.id, &[]);
 
-        let grads = {
+        // Phase 1: Build tape under lock (reads tape from server, consumes steps)
+        let result = {
+            let mut state = graph.state.lock();
+            state.server.prepare_backward(node_id)
+        }; // LOCK RELEASED
+
+        // Phase 2: Execute steps WITHOUT lock (pure computation on owned values)
+        let grads = Gradients::new::<B>(root.node.clone(), root.primitive);
+        let grads = AutodiffServer::execute_steps(result.tape, grads, result.checkpointer);
+
+        // Phase 3: Cleanup under lock
+        {
             let mut state = graph.state.lock();
             state
                 .server
-                .backward::<GraphCleaner, B>(root.node, root.primitive, node_id)
-        }; // lock released
+                .cleanup_after_backward::<GraphCleaner>(result.consumed);
+        }
 
         GraphCleaner::cleanup_orphaned_entries();
 
@@ -132,12 +143,23 @@ impl AutodiffClient for GraphMutexClient {
         let node_id = root.node.id;
         let graph = GraphMutexClient::graph(root.node.id, &[]);
 
-        let grads = {
+        // Phase 1: Build tape under lock (reads tape from server, consumes steps)
+        let mut result = {
+            let mut state = graph.state.lock();
+            state.server.prepare_backward(node_id)
+        }; // LOCK RELEASED
+
+        // Phase 2: Compute gradients WITHOUT lock (pure computation on owned values)
+        let consumed = core::mem::take(&mut result.consumed);
+        let grads = AutodiffServer::compute_gradients::<B>(root.node, root.primitive, result);
+
+        // Phase 3: Cleanup under lock
+        {
             let mut state = graph.state.lock();
             state
                 .server
-                .backward::<GraphCleaner, B>(root.node, root.primitive, node_id)
-        }; // lock released
+                .cleanup_after_backward::<GraphCleaner>(consumed);
+        }
 
         GraphCleaner::cleanup_orphaned_entries();
 

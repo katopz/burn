@@ -210,10 +210,19 @@ pub struct Gemma2MLPLora<B: Backend> {
 
 impl<B: Backend> Gemma2MLPLora<B> {
     /// Forward pass: `[batch, seq, hidden] -> [batch, seq, hidden]`.
+    ///
+    /// Uses f32 upcast for GELU computation (x^3 and tanh lose precision in f16),
+    /// following the same cast→compute→cast-back pattern as `rms_norm_f32`.
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
-        let gate = gelu_approximate(self.gate_proj.forward(x.clone()));
-        let up = self.up_proj.forward(x);
-        self.down_proj.forward(gate.mul(up))
+        let original_dtype = x.dtype();
+
+        // Upcast to f32 for GELU: x^3 and tanh approximation lose precision in f16.
+        let gate = self.gate_proj.forward(x.clone()).cast(FloatDType::F32);
+        let gate = gelu_approximate(gate);
+        let up = self.up_proj.forward(x).cast(FloatDType::F32);
+
+        // Multiply in f32, cast back to original dtype for down_proj
+        self.down_proj.forward(gate.mul(up).cast(original_dtype))
     }
 }
 
@@ -908,13 +917,16 @@ fn mask_normalize_ce<B: Backend>(
 ) -> Tensor<B, 1> {
     let [batch_size, seq_len] = token_losses.dims();
     let device = token_losses.device();
+    let original_dtype = token_losses.dtype();
     let masked_ce = token_losses.mask_fill(mask_pad.clone(), 0);
-    // Keep ntokens in same dtype as token_losses to avoid DTypeMismatch
-    // in autodiff backward when dividing f16 sum / f32 ntokens.
+    // Upcast sum accumulation to f32 for precision (same pattern as rms_norm_f32).
+    // Both operands cast to f32 before sum+division avoids DTypeMismatch in autodiff.
+    let masked_ce_sum = masked_ce.cast(FloatDType::F32).sum();
     let ntokens = Tensor::<B, 2>::ones([batch_size, seq_len], &device)
         .mask_fill(mask_pad, 0)
+        .cast(FloatDType::F32)
         .sum();
-    masked_ce.sum() / ntokens
+    (masked_ce_sum / ntokens).cast(original_dtype)
 }
 
 /// TrainStep for cubecl GPU backends (metal, wgpu, cuda, vulkan, rocm).

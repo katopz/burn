@@ -239,10 +239,19 @@ impl<B: Backend> Gemma2MLP<B> {
     }
 
     /// Forward pass: `[batch, seq, hidden] -> [batch, seq, hidden]`.
+    ///
+    /// Uses f32 upcast for GELU computation (x^3 and tanh lose precision in f16),
+    /// following the same cast→compute→cast-back pattern as `rms_norm_f32`.
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
-        let gate = gelu_approximate(self.gate_proj.forward(x.clone()));
-        let up = self.up_proj.forward(x);
-        self.down_proj.forward(gate.mul(up))
+        let original_dtype = x.dtype();
+
+        // Upcast to f32 for GELU: x^3 and tanh approximation lose precision in f16.
+        let gate = self.gate_proj.forward(x.clone()).cast(FloatDType::F32);
+        let gate = gelu_approximate(gate);
+        let up = self.up_proj.forward(x).cast(FloatDType::F32);
+
+        // Multiply in f32, cast back to original dtype for down_proj
+        self.down_proj.forward(gate.mul(up).cast(original_dtype))
     }
 }
 

@@ -44,6 +44,7 @@
 //! | `--weight-decay` | `0.01` | Adam weight decay (L2 regularization) |
 //! | `--max-duration` | (none) | Max training duration in seconds (unlimited if not set) |
 //! | `--max-ram` | (none) | Max RAM usage in GB, stops training if exceeded (macOS only) |
+//! | `--warmup-steps` | `0` | Linear LR warmup steps before cosine decay (0 = no warmup) |
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,7 +56,9 @@ use burn::nn::lora::{LoraBias, LoraConfig};
 use burn::optim::AdamConfig;
 use burn::optim::decay::WeightDecayConfig;
 use burn::optim::grad_clipping::GradientClippingConfig;
+use burn::optim::lr_scheduler::composed::{ComposedLrSchedulerConfig, SchedulerReduction};
 use burn::optim::lr_scheduler::cosine::CosineAnnealingLrSchedulerConfig;
+use burn::optim::lr_scheduler::linear::LinearLrSchedulerConfig;
 use burn::record::CompactRecorder;
 use burn::tensor::Element;
 use burn::tensor::backend::AutodiffBackend;
@@ -117,6 +120,8 @@ struct SftArgs {
     max_duration: Option<u64>,
     /// Max RAM usage in GB (None = unlimited, macOS only).
     max_ram: Option<f64>,
+    /// Linear LR warmup steps before cosine decay (0 = no warmup).
+    warmup_steps: usize,
 }
 
 impl SftArgs {
@@ -142,6 +147,7 @@ impl SftArgs {
             weight_decay: 0.01,
             max_duration: None,
             max_ram: None,
+            warmup_steps: 0,
         };
 
         let cli: Vec<String> = std::env::args().collect();
@@ -289,6 +295,14 @@ impl SftArgs {
                     );
                     i += 2;
                 }
+                "--warmup-steps" => {
+                    args.warmup_steps = cli
+                        .get(i + 1)
+                        .expect("--warmup-steps requires a value")
+                        .parse()
+                        .expect("invalid warmup-steps");
+                    i += 2;
+                }
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -362,6 +376,7 @@ fn print_usage() {
     eprintln!(
         "  --max-ram <GB>           Max RAM usage in GB, stops if exceeded (default: unlimited)"
     );
+    eprintln!("  --warmup-steps <N>       Linear LR warmup steps (default: 0, no warmup)");
 }
 
 // ---------------------------------------------------------------------------
@@ -756,16 +771,43 @@ fn run<B: SftBackend>(args: SftArgs, device: B::Device) {
     // -----------------------------------------------------------------------
     log::info!("[8/8] Starting training...\n");
 
-    // Cosine annealing LR schedule: decays from lr to near-zero over all training steps
-    let lr_scheduler = CosineAnnealingLrSchedulerConfig::new(effective_lr, total_steps)
-        .with_min_lr(effective_lr * 0.1)
-        .init()
-        .expect("Invalid LR scheduler config");
+    // LR schedule: optional linear warmup + cosine annealing decay
+    let warmup_steps = args.warmup_steps;
+    let cosine_config = CosineAnnealingLrSchedulerConfig::new(effective_lr, total_steps)
+        .with_min_lr(effective_lr * 0.1);
 
-    log::info!(
-        "  LR schedule: cosine (initial={effective_lr:.6}, min={:.6}, steps={total_steps})",
-        effective_lr * 0.1,
-    );
+    let lr_scheduler = if warmup_steps > 0 {
+        // Warmup: linear 0.01 → 1.0 over warmup_steps, then stays at 1.0
+        // Combined with cosine via Prod: warmup_mult × cosine_lr
+        // Step 0: 0.01 × lr ≈ 0, Step warmup: 1.0 × lr, then cosine decay
+        let warmup_config = LinearLrSchedulerConfig::new(0.01, 1.0, warmup_steps);
+
+        ComposedLrSchedulerConfig::new()
+            .linear(warmup_config)
+            .cosine(cosine_config)
+            .with_reduction(SchedulerReduction::Prod)
+            .init()
+            .expect("Invalid composed LR scheduler config")
+    } else {
+        // No warmup — pure cosine decay
+        ComposedLrSchedulerConfig::new()
+            .cosine(cosine_config)
+            .with_reduction(SchedulerReduction::Prod)
+            .init()
+            .expect("Invalid LR scheduler config")
+    };
+
+    if warmup_steps > 0 {
+        log::info!(
+            "  LR schedule: linear warmup ({warmup_steps} steps) + cosine decay (initial={effective_lr:.6}, min={:.6}, steps={total_steps})",
+            effective_lr * 0.1,
+        );
+    } else {
+        log::info!(
+            "  LR schedule: cosine (initial={effective_lr:.6}, min={:.6}, steps={total_steps})",
+            effective_lr * 0.1,
+        );
+    }
     log::info!(
         "  Total iterations: {total_steps} ({steps_per_epoch}/epoch × {} epochs)",
         args.epochs

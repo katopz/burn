@@ -84,13 +84,23 @@ pub struct SFTBatcher {
 impl SFTBatcher {
     /// Create a new SFT batcher.
     ///
+    /// The `max_seq_length` is rounded up to the next multiple of 32
+    /// for GPU SIMD alignment (Metal warp size = 32 threads).
+    ///
     /// # Arguments
     /// * `tokenizer` — Shared tokenizer instance (wrapped in `Arc` for thread safety)
-    /// * `max_seq_length` — Maximum sequence length. Sequences are truncated to this length.
+    /// * `max_seq_length` — Maximum sequence length. Rounded up to SIMD alignment.
     pub fn new(tokenizer: Arc<GemmaTokenizer>, max_seq_length: usize) -> Self {
+        const SIMD_ALIGN: usize = 32;
+        let aligned_length = max_seq_length.next_multiple_of(SIMD_ALIGN);
+        if aligned_length != max_seq_length {
+            log::debug!(
+                "Aligned max_seq_length: {max_seq_length} → {aligned_length} (SIMD={SIMD_ALIGN})"
+            );
+        }
         Self {
             tokenizer,
-            max_seq_length,
+            max_seq_length: aligned_length,
         }
     }
 

@@ -42,9 +42,12 @@
 //! | `--grad-accum` | `8` | Gradient accumulation steps (effective batch = batch × accum) |
 //! | `--max-grad-norm` | `1.0` | Max gradient norm for clipping (0 = disabled) |
 //! | `--weight-decay` | `0.01` | Adam weight decay (L2 regularization) |
+//! | `--max-duration` | (none) | Max training duration in seconds (unlimited if not set) |
+//! | `--max-ram` | (none) | Max RAM usage in GB, stops training if exceeded (macOS only) |
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::module::{AutodiffModule, Module, Quantizer};
@@ -110,6 +113,10 @@ struct SftArgs {
     max_grad_norm: f32,
     /// Adam weight decay (L2 regularization).
     weight_decay: f32,
+    /// Max training duration in seconds (None = unlimited).
+    max_duration: Option<u64>,
+    /// Max RAM usage in GB (None = unlimited, macOS only).
+    max_ram: Option<f64>,
 }
 
 impl SftArgs {
@@ -122,17 +129,19 @@ impl SftArgs {
             weights: None,
             lora_rank: 16,
             lora_alpha: 32.0,
-            epochs: 3,
-            batch_size: 4,
+            epochs: 1,
+            batch_size: 1,
             learning_rate: 2e-4,
-            max_seq_length: 2048,
+            max_seq_length: 512,
             val_split: 0.1,
             seed: 42,
             tokenizer: None,
             quantize: "none".into(),
-            grad_accum: 8,
+            grad_accum: 4,
             max_grad_norm: 1.0,
             weight_decay: 0.01,
+            max_duration: None,
+            max_ram: None,
         };
 
         let cli: Vec<String> = std::env::args().collect();
@@ -262,6 +271,24 @@ impl SftArgs {
                         .expect("invalid weight-decay");
                     i += 2;
                 }
+                "--max-duration" => {
+                    args.max_duration = Some(
+                        cli.get(i + 1)
+                            .expect("--max-duration requires a value")
+                            .parse()
+                            .expect("invalid max-duration (seconds)"),
+                    );
+                    i += 2;
+                }
+                "--max-ram" => {
+                    args.max_ram = Some(
+                        cli.get(i + 1)
+                            .expect("--max-ram requires a value")
+                            .parse()
+                            .expect("invalid max-ram (GB)"),
+                    );
+                    i += 2;
+                }
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -321,26 +348,84 @@ fn print_usage() {
     eprintln!("  --weights <PATH>         Safetensors model weights path");
     eprintln!("  --lora-rank <N>          LoRA rank (default: 16)");
     eprintln!("  --lora-alpha <F>         LoRA alpha (default: 32.0)");
-    eprintln!("  --epochs <N>             Training epochs (default: 3)");
-    eprintln!("  --batch-size <N>         Batch size (default: 4)");
+    eprintln!("  --epochs <N>             Training epochs (default: 1)");
+    eprintln!("  --batch-size <N>         Batch size (default: 1)");
     eprintln!("  --lr <F>                 Learning rate (default: 2e-4)");
-    eprintln!("  --max-seq-length <N>     Max sequence length (default: 2048)");
+    eprintln!("  --max-seq-length <N>     Max sequence length (default: 512)");
     eprintln!("  --val-split <F>          Validation split ratio (default: 0.1)");
     eprintln!("  --seed <N>               Random seed (default: 42)");
     eprintln!("  --quantize <SCHEME>      Quantize frozen weights: none, q4s, q8s (default: none)");
-    eprintln!("  --grad-accum <N>         Gradient accumulation steps (default: 8)");
+    eprintln!("  --grad-accum <N>         Gradient accumulation steps (default: 4)");
     eprintln!("  --max-grad-norm <F>      Max gradient norm for clipping, 0=off (default: 1.0)");
     eprintln!("  --weight-decay <F>       Adam weight decay / L2 reg (default: 0.01)");
+    eprintln!("  --max-duration <S>       Max training duration in seconds (default: unlimited)");
+    eprintln!(
+        "  --max-ram <GB>           Max RAM usage in GB, stops if exceeded (default: unlimited)"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Training Pipeline
 // ---------------------------------------------------------------------------
 
+/// Backend trait bound for SFT training.
+///
+/// For cubecl backends (metal, wgpu, cuda, vulkan, rocm): includes fused CE kernel support.
+/// For other backends (ndarray, tch): standard autodiff backend only.
+#[cfg(any(
+    feature = "metal",
+    feature = "wgpu",
+    feature = "cuda",
+    feature = "vulkan",
+    feature = "rocm"
+))]
+trait SftBackend: AutodiffBackend + lora_gemma2::fused_ops::FusedCEBackend {}
+#[cfg(any(
+    feature = "metal",
+    feature = "wgpu",
+    feature = "cuda",
+    feature = "vulkan",
+    feature = "rocm"
+))]
+impl<T: AutodiffBackend + lora_gemma2::fused_ops::FusedCEBackend> SftBackend for T {}
+
+#[cfg(not(any(
+    feature = "metal",
+    feature = "wgpu",
+    feature = "cuda",
+    feature = "vulkan",
+    feature = "rocm"
+)))]
+trait SftBackend: AutodiffBackend {}
+#[cfg(not(any(
+    feature = "metal",
+    feature = "wgpu",
+    feature = "cuda",
+    feature = "vulkan",
+    feature = "rocm"
+)))]
+impl<T: AutodiffBackend> SftBackend for T {}
+
+/// Get current process RSS (Resident Set Size) in GB.
+///
+/// Uses `ps` command (macOS/Linux compatible). Returns `None` if unavailable.
+fn get_process_rss_gb() -> Option<f64> {
+    let pid = std::process::id();
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let rss_kb: f64 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .ok()?;
+    Some(rss_kb / 1024.0 / 1024.0) // KB -> GB
+}
+
 /// Run the SFT training pipeline.
 ///
 /// Generic over any autodiff backend (NdArray, Wgpu, Metal, etc.)
-fn run<B: AutodiffBackend>(args: SftArgs, device: B::Device) {
+fn run<B: SftBackend>(args: SftArgs, device: B::Device) {
     log::info!("=== LoRA SFT Training for Gemma 2 ===\n");
 
     // -----------------------------------------------------------------------
@@ -616,6 +701,55 @@ fn run<B: AutodiffBackend>(args: SftArgs, device: B::Device) {
     }
 
     let training = training.summary();
+
+    // -----------------------------------------------------------------------
+    // 8b. Resource Limits (Duration + RAM)
+    // -----------------------------------------------------------------------
+    let max_duration = args.max_duration;
+    let max_ram = args.max_ram;
+
+    if max_duration.is_some() || max_ram.is_some() {
+        let interrupter = training.interrupter();
+        log::info!("  Resource limits:");
+        if let Some(secs) = max_duration {
+            log::info!("    Duration: {secs}s ({:.1}min)", secs as f64 / 60.0);
+        }
+        if let Some(gb) = max_ram {
+            log::info!("    RAM: {gb:.1} GB");
+        }
+
+        // Spawn monitoring thread — checks duration/RAM every 5s, stops training via Interrupter
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let interval = std::time::Duration::from_secs(5);
+            loop {
+                std::thread::sleep(interval);
+
+                if let Some(max_secs) = max_duration {
+                    let elapsed = start.elapsed().as_secs();
+                    if elapsed >= max_secs {
+                        let reason = format!(
+                            "Duration limit: {elapsed}s >= {max_secs}s ({:.1}min)",
+                            max_secs as f64 / 60.0
+                        );
+                        log::warn!("⚠ {reason}");
+                        interrupter.stop(Some(&reason));
+                        return;
+                    }
+                }
+
+                if let Some(max_gb) = max_ram
+                    && let Some(rss_gb) = get_process_rss_gb()
+                    && rss_gb > max_gb
+                {
+                    let reason = format!("RAM limit: {rss_gb:.1} GB > {max_gb:.1} GB");
+                    log::warn!("⚠ {reason}");
+                    interrupter.stop(Some(&reason));
+                    return;
+                }
+            }
+        });
+    }
 
     // -----------------------------------------------------------------------
     // 9. Run Training

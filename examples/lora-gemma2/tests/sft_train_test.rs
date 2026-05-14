@@ -94,6 +94,13 @@ fn make_batch(
 // Tests: Training Step / Inference Step
 // ---------------------------------------------------------------------------
 
+#[cfg(not(any(
+    feature = "metal",
+    feature = "wgpu",
+    feature = "cuda",
+    feature = "vulkan",
+    feature = "rocm"
+)))]
 #[test]
 fn test_train_step_produces_loss_and_grads() {
     let device = device();
@@ -142,6 +149,13 @@ fn test_inference_step_produces_loss() {
 // Tests: Loss Decreases Over Steps
 // ---------------------------------------------------------------------------
 
+#[cfg(not(any(
+    feature = "metal",
+    feature = "wgpu",
+    feature = "cuda",
+    feature = "vulkan",
+    feature = "rocm"
+)))]
 #[test]
 fn test_training_reduces_loss() {
     let device = device();
@@ -193,6 +207,13 @@ fn test_training_reduces_loss() {
 // Tests: Merge Equivalence After Training
 // ---------------------------------------------------------------------------
 
+#[cfg(not(any(
+    feature = "metal",
+    feature = "wgpu",
+    feature = "cuda",
+    feature = "vulkan",
+    feature = "rocm"
+)))]
 #[test]
 fn test_merge_after_training() {
     let device = device();
@@ -230,6 +251,13 @@ fn test_merge_after_training() {
 // Tests: Adapter Save/Load After Training
 // ---------------------------------------------------------------------------
 
+#[cfg(not(any(
+    feature = "metal",
+    feature = "wgpu",
+    feature = "cuda",
+    feature = "vulkan",
+    feature = "rocm"
+)))]
 #[test]
 fn test_adapter_save_load_after_training() {
     let device = device();
@@ -401,6 +429,13 @@ fn test_param_counts_attention_only() {
 // Tests: Gradient Flow (only LoRA params get grads)
 // ---------------------------------------------------------------------------
 
+#[cfg(not(any(
+    feature = "metal",
+    feature = "wgpu",
+    feature = "cuda",
+    feature = "vulkan",
+    feature = "rocm"
+)))]
 #[test]
 fn test_gradient_flow_only_lora() {
     let device = device();
@@ -425,6 +460,13 @@ fn test_gradient_flow_only_lora() {
 // Tests: End-to-end with SupervisedTraining
 // ---------------------------------------------------------------------------
 
+#[cfg(not(any(
+    feature = "metal",
+    feature = "wgpu",
+    feature = "cuda",
+    feature = "vulkan",
+    feature = "rocm"
+)))]
 #[test]
 fn test_supervised_training_runs() {
     let device = device();

@@ -39,6 +39,14 @@ pub mod dataset;
     feature = "vulkan",
     feature = "rocm"
 ))]
+pub mod fused_ops;
+#[cfg(any(
+    feature = "metal",
+    feature = "wgpu",
+    feature = "cuda",
+    feature = "vulkan",
+    feature = "rocm"
+))]
 pub mod kernel;
 pub mod loader;
 pub mod model;

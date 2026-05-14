@@ -28,6 +28,9 @@ remote = ["burn/remote", "burn/default"]
 burn = { path = "../../crates/burn", features = ["train", "tui"] }
 burn-backend = { path = "../../crates/burn-backend" }
 burn-cubecl = { path = "../../crates/burn-cubecl" }
+burn-cubecl-fusion = { path = "../../crates/burn-cubecl-fusion" }
+burn-fusion = { path = "../../crates/burn-fusion" }
+burn-ir = { path = "../../crates/burn-ir" }
 burn-ndarray = { path = "../../crates/burn-ndarray", optional = true }
 burn-store = { path = "../../crates/burn-store", features = ["std", "safetensors"] }
 cubecl = { workspace = true }

@@ -306,6 +306,31 @@ impl<B: Backend> Gemma2ModelLora<B> {
             .cast(original_dtype)
     }
 
+    /// Forward pass returning raw logits WITHOUT final logit softcapping.
+    ///
+    /// Used by the fused CE training path where softcapping is applied
+    /// inline in the GPU kernel, avoiding materialization of the
+    /// `[batch, seq, 256K]` softcapped logits tensor (~4GB for seq=2048).
+    ///
+    /// For inference, use [`forward()`](Self::forward) which applies softcapping.
+    pub fn forward_raw(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+        let device = input_ids.device();
+        let [_batch, seq_len] = input_ids.dims();
+
+        let scale = (self.hidden_size as f64).sqrt();
+        let h = self.embed.forward(input_ids).mul_scalar(scale);
+
+        let mask = causal_mask::<B>(seq_len, &device);
+
+        let mut h = h;
+        for layer in &self.layers {
+            h = layer.forward(h, Some(mask.clone()));
+        }
+
+        let h = rms_norm_f32(&self.norm, h);
+        self.lm_head.forward(h)
+    }
+
     /// Merge all LoRA weights into base layers for inference.
     ///
     /// Returns a standard [`Gemma2Model`] with no LoRA overhead.
@@ -733,45 +758,121 @@ impl<B: Backend> ModuleDisplay for Gemma2ForSFT<B> {
 // TrainStep / InferenceStep
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// TrainStep — fused CE loss path (cubecl backends: metal, wgpu, cuda, vulkan, rocm)
+// ---------------------------------------------------------------------------
+
+/// Fused cross-entropy TrainStep for cubecl GPU backends.
+///
+/// Replaces the standard CE tensor op chain (log_softmax → gather → neg → mask_fill)
+/// with a single fused GPU kernel, avoiding materialization of the
+/// `[batch*seq, 256K]` log_probs tensor (~4GB for seq=2048).
+///
+/// The backward pass also uses a single fused kernel (softmax + gradient),
+/// replacing ~10 autodiff backward steps with 1 GPU dispatch.
+///
+/// Reference: `unsloth/kernels/cross_entropy_loss.py` Fast_CrossEntropyLoss
+// ---------------------------------------------------------------------------
+// TrainStep / InferenceStep
+// ---------------------------------------------------------------------------
+
+/// Shared masking + normalization for per-token CE losses.
+///
+/// Both fused and standard CE paths produce per-token losses `[batch, seq]`.
+/// This helper applies padding masking and token-count normalization.
+///
+/// `mask_pad`: true = padding position. `token_losses`: raw CE per token.
+fn mask_normalize_ce<B: Backend>(
+    token_losses: Tensor<B, 2>,
+    mask_pad: Tensor<B, 2, burn::tensor::Bool>,
+) -> Tensor<B, 1> {
+    let [batch_size, seq_len] = token_losses.dims();
+    let device = token_losses.device();
+    let masked_ce = token_losses.mask_fill(mask_pad.clone(), 0);
+    let ntokens = Tensor::<B, 2>::ones([batch_size, seq_len], &device)
+        .cast(FloatDType::F32)
+        .mask_fill(mask_pad, 0)
+        .sum();
+    masked_ce.sum() / ntokens
+}
+
+/// Fused CE TrainStep for cubecl GPU backends (metal, wgpu, cuda, vulkan, rocm).
+///
+/// Replaces `log_softmax → gather → neg` (10+ autodiff backward steps)
+/// with a single fused GPU kernel (1 forward + 1 backward dispatch).
+/// Avoids materializing `[batch*seq, 256K]` log_probs (~4GB for seq=2048).
+///
+/// NOTE: Requires `B: FusedCEBackend` — the caller's `run()` function must
+/// propagate this bound. See `sft-train.rs` for the matching cfg-conditional bounds.
+#[cfg(any(
+    feature = "metal",
+    feature = "wgpu",
+    feature = "cuda",
+    feature = "vulkan",
+    feature = "rocm"
+))]
+impl<B> TrainStep for Gemma2ForSFT<B>
+where
+    B: AutodiffBackend + crate::fused_ops::FusedCEBackend,
+{
+    type Input = SFTTrainingBatch<B>;
+    type Output = SequenceOutput<B>;
+
+    fn step(&self, batch: SFTTrainingBatch<B>) -> TrainOutput<SequenceOutput<B>> {
+        // Use forward_raw() to skip softcapping — it's fused into the CE kernel.
+        // This avoids materializing the [batch*seq, 256K] softcapped logits tensor.
+        let logits = self.model.forward_raw(batch.tokens_inputs);
+        let targets = batch.targets;
+        let [batch_size, seq_len, vocab_size] = logits.dims();
+
+        // Fused CE with inline softcapping: sc(x) + log_softmax + gather + neg
+        // in ONE GPU kernel. Softcap value from model config (Gemma 2 2B = 30.0).
+        //
+        // NOTE: Runs in native f16 (no f32 cast). Softcapping bounds logits to
+        // [-30, 30] which keeps logsumexp numerically stable in f16. This avoids
+        // materializing the [batch*seq, 256K] f32 tensor (~4GB savings for seq=2048).
+        let softcap = Some(self.model.final_logit_softcapping as f32);
+        let logits_flat = logits.clone().reshape([batch_size * seq_len, vocab_size]);
+        let targets_flat = targets.clone().reshape([batch_size * seq_len]);
+        let token_losses = crate::fused_ops::fused_ce_loss::<B>(logits_flat, targets_flat, softcap)
+            .reshape([batch_size, seq_len]);
+
+        let loss = mask_normalize_ce(token_losses, batch.mask_pad.clone());
+
+        // NOTE: Do NOT call loss.into_scalar() — GPU sync costs ~800ms/iter.
+        TrainOutput::new(
+            self,
+            loss.backward(),
+            SequenceOutput::new(loss, logits, None, targets),
+        )
+    }
+}
+
+/// Standard CE TrainStep for non-cubecl backends (ndarray, tch).
+#[cfg(not(any(
+    feature = "metal",
+    feature = "wgpu",
+    feature = "cuda",
+    feature = "vulkan",
+    feature = "rocm"
+)))]
 impl<B: AutodiffBackend> TrainStep for Gemma2ForSFT<B> {
     type Input = SFTTrainingBatch<B>;
     type Output = SequenceOutput<B>;
 
     fn step(&self, batch: SFTTrainingBatch<B>) -> TrainOutput<SequenceOutput<B>> {
-        // Forward pass: [batch, seq] -> [batch, seq, vocab]
         let logits = self.model.forward(batch.tokens_inputs);
         let targets = batch.targets;
-
-        // Token-normalized cross-entropy loss (matches Python's sft_loss approach):
-        //   loss = sum(CE_per_token * non_pad_mask) / num_non_pad_tokens
-        // Python ref: unsloth-mlx losses.py sft_loss() — masked_ce.sum() / ntoks
-        //
-        // Mixed precision: cast logits to f32 for numerically stable log_softmax.
-        // f16 log_softmax causes loss spikes on Metal due to limited precision in
-        // the exp/sum/log operations.
         let [batch_size, seq_len, _vocab_size] = logits.dims();
-        let device = logits.device();
+
         let logits_f32 = logits.clone().cast(FloatDType::F32);
-        let log_probs = log_softmax(logits_f32, 2); // [batch, seq, vocab]
         let target_indices = targets.clone().reshape([batch_size, seq_len, 1]);
-        let token_log_probs = log_probs
+        let token_losses = log_softmax(logits_f32, 2)
             .gather(2, target_indices)
-            .reshape([batch_size, seq_len]); // [batch, seq]
+            .reshape([batch_size, seq_len])
+            .neg();
 
-        // Per-token CE, zero out padding positions (mask_pad: true = padding)
-        let masked_ce = token_log_probs.neg().mask_fill(batch.mask_pad.clone(), 0);
-
-        // Normalize by actual non-padding token count (not batch*seq_len)
-        // Keep in f32 to match masked_ce dtype (DTypeMismatch if mixed with f16)
-        let ntokens = Tensor::<B, 2>::ones([batch_size, seq_len], &device)
-            .cast(FloatDType::F32)
-            .mask_fill(batch.mask_pad, 0)
-            .sum();
-        let loss = masked_ce.sum() / ntokens.clone();
-
-        // NOTE: Do NOT call loss.into_scalar() here — it forces a GPU sync
-        // that costs ~800ms per iteration (17% overhead). The loss value is
-        // tracked via burn's learner metrics (SequenceOutput.loss) instead.
+        let loss = mask_normalize_ce(token_losses, batch.mask_pad.clone());
 
         TrainOutput::new(
             self,

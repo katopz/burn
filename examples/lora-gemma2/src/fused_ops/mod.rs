@@ -49,8 +49,11 @@
 
 mod backward;
 mod forward;
+mod lora_mlp;
 
 use burn::tensor::{Int, Tensor, TensorPrimitive, ops::FloatTensor};
+
+pub use lora_mlp::{FusedLoraMLPBackend, FusedLoraMLPGrads, FusedLoraMLPState, fused_lora_mlp};
 
 /// Backend trait for fused cross-entropy loss operations with optional softcapping.
 ///

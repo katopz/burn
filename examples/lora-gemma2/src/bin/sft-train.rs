@@ -415,7 +415,12 @@ fn print_usage() {
     feature = "vulkan",
     feature = "rocm"
 ))]
-trait SftBackend: AutodiffBackend + lora_gemma2::fused_ops::FusedCEBackend {}
+trait SftBackend:
+    AutodiffBackend
+    + lora_gemma2::fused_ops::FusedCEBackend
+    + lora_gemma2::fused_ops::FusedLoraMLPBackend
+{
+}
 #[cfg(any(
     feature = "metal",
     feature = "wgpu",
@@ -423,7 +428,12 @@ trait SftBackend: AutodiffBackend + lora_gemma2::fused_ops::FusedCEBackend {}
     feature = "vulkan",
     feature = "rocm"
 ))]
-impl<T: AutodiffBackend + lora_gemma2::fused_ops::FusedCEBackend> SftBackend for T {}
+impl<T> SftBackend for T where
+    T: AutodiffBackend
+        + lora_gemma2::fused_ops::FusedCEBackend
+        + lora_gemma2::fused_ops::FusedLoraMLPBackend
+{
+}
 
 #[cfg(not(any(
     feature = "metal",

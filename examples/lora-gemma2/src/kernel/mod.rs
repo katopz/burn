@@ -15,5 +15,7 @@
 //! - `burn/examples/custom-cubecl-kernel/` — `#[cube]` + autodiff backward example
 
 pub mod cross_entropy;
+pub mod geglu;
 
 pub use cross_entropy::{fused_ce_backward, fused_ce_forward};
+pub use geglu::geglu_backward;

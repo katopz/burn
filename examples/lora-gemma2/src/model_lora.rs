@@ -47,6 +47,7 @@ use burn::tensor::{
 use burn::train::{InferenceStep, SequenceOutput, TrainOutput, TrainStep};
 
 use crate::batcher::SFTTrainingBatch;
+use crate::fused_ops::FusedLoraMLPBackend;
 use crate::model::{Gemma2Attention, Gemma2Block, Gemma2MLP, Gemma2Model};
 use crate::types::LoraTarget;
 
@@ -216,6 +217,66 @@ impl<B: Backend> Gemma2MLPLora<B> {
     }
 }
 
+/// Fused LoRA MLP forward for cubecl GPU backends.
+///
+/// Replaces 3 separate `LoraLinear.forward()` calls (15+ autodiff backward
+/// steps per MLP block) with a single fused forward+backward dispatch.
+///
+/// **Note:** Skips LoRA dropout (normally 0 for fine-tuning).
+/// **Note:** Does not handle bias in base linear layers (Gemma 2 has no MLP bias).
+#[cfg(any(
+    feature = "metal",
+    feature = "wgpu",
+    feature = "cuda",
+    feature = "vulkan",
+    feature = "rocm"
+))]
+impl<B: FusedLoraMLPBackend> Gemma2MLPLora<B> {
+    /// Forward pass using the fused LoRA MLP kernel.
+    ///
+    /// Fuses gate+up+down LoRA projections with GeGLU activation into
+    /// a single autodiff backward step. On backward, computes all 7 gradients
+    /// (dX + 6 LoRA weight grads) in one dispatch instead of ~15.
+    pub fn forward_fused<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
+        // Handle 1D input by temporarily upgrading to 2D
+        if D == 1 {
+            let input_2d: Tensor<B, 2> = x.unsqueeze_dim(0);
+            let output_2d = self.forward_fused(input_2d);
+            return output_2d.squeeze_dim(0);
+        }
+
+        // Save original dims for reshaping back
+        let dims = x.dims();
+
+        // Flatten to 2D: [..., d_in] -> [N, d_in]
+        let n: usize = dims[..D - 1].iter().product();
+        let x_2d = x.reshape([n, dims[D - 1]]);
+
+        // Extract LoRA weights and frozen base weights from LoraLinear modules.
+        // Dropout is skipped (normally disabled for LoRA fine-tuning).
+        let out_2d = crate::fused_ops::fused_lora_mlp::<B>(
+            x_2d,
+            self.gate_proj.lora_a.val(),
+            self.gate_proj.lora_b.val(),
+            self.gate_proj.scaling,
+            self.up_proj.lora_a.val(),
+            self.up_proj.lora_b.val(),
+            self.up_proj.scaling,
+            self.down_proj.lora_a.val(),
+            self.down_proj.lora_b.val(),
+            self.down_proj.scaling,
+            self.gate_proj.base.weight.val(),
+            self.up_proj.base.weight.val(),
+            self.down_proj.base.weight.val(),
+        );
+
+        // Reshape back: [N, d_out] -> [..., d_out]
+        let mut out_dims = dims;
+        out_dims[D - 1] = out_2d.dims()[1];
+        out_2d.reshape(out_dims)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LoRA Transformer Block
 // ---------------------------------------------------------------------------
@@ -246,6 +307,38 @@ impl<B: Backend> Gemma2BlockLora<B> {
         let r = self
             .mlp
             .forward(rms_norm_f32(&self.pre_feedforward_layernorm, h.clone()));
+        h + rms_norm_f32(&self.post_feedforward_layernorm, r)
+    }
+}
+
+/// Fused LoRA MLP forward for cubecl GPU backends.
+///
+/// Uses `Gemma2MLPLora::forward_fused()` which replaces 3 separate LoraLinear
+/// calls with a single fused dispatch, reducing autodiff backward steps from
+/// ~15 to 1 per MLP block.
+#[cfg(any(
+    feature = "metal",
+    feature = "wgpu",
+    feature = "cuda",
+    feature = "vulkan",
+    feature = "rocm"
+))]
+impl<B: FusedLoraMLPBackend> Gemma2BlockLora<B> {
+    /// Forward pass with fused LoRA MLP kernel.
+    ///
+    /// Identical to [`forward`](Self::forward) but uses the fused MLP kernel
+    /// for the feedforward block, reducing GPU dispatches and autodiff overhead.
+    pub fn forward_fused(&self, x: Tensor<B, 3>, mask: Option<Tensor<B, 2>>) -> Tensor<B, 3> {
+        // Attention with sandwich norm (mixed precision for stability)
+        let r = self
+            .self_attn
+            .forward(rms_norm_f32(&self.input_layernorm, x.clone()), mask);
+        let h = x.clone() + rms_norm_f32(&self.post_attention_layernorm, r);
+
+        // Fused MLP with sandwich norm
+        let r = self
+            .mlp
+            .forward_fused(rms_norm_f32(&self.pre_feedforward_layernorm, h.clone()));
         h + rms_norm_f32(&self.post_feedforward_layernorm, r)
     }
 }
@@ -325,6 +418,42 @@ impl<B: Backend> Gemma2ModelLora<B> {
         let mut h = h;
         for layer in &self.layers {
             h = layer.forward(h, Some(mask.clone()));
+        }
+
+        let h = rms_norm_f32(&self.norm, h);
+        self.lm_head.forward(h)
+    }
+
+    /// Forward pass with fused LoRA MLP kernels, returning raw logits without softcapping.
+    ///
+    /// Uses [`Gemma2BlockLora::forward_fused`] which replaces 3 separate `LoraLinear`
+    /// calls per block with a single fused dispatch, reducing autodiff backward steps
+    /// from ~15 to 1 per MLP block (~390 total → ~26).
+    ///
+    /// Only available on cubecl GPU backends (metal, wgpu, cuda, vulkan, rocm).
+    /// Use [`forward_raw`](Self::forward_raw) for non-cubecl backends.
+    #[cfg(any(
+        feature = "metal",
+        feature = "wgpu",
+        feature = "cuda",
+        feature = "vulkan",
+        feature = "rocm"
+    ))]
+    pub fn forward_raw_fused(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3>
+    where
+        B: FusedLoraMLPBackend,
+    {
+        let device = input_ids.device();
+        let [_batch, seq_len] = input_ids.dims();
+
+        let scale = (self.hidden_size as f64).sqrt();
+        let h = self.embed.forward(input_ids).mul_scalar(scale);
+
+        let mask = causal_mask::<B>(seq_len, &device);
+
+        let mut h = h;
+        for layer in &self.layers {
+            h = layer.forward_fused(h, Some(mask.clone()));
         }
 
         let h = rms_norm_f32(&self.norm, h);
@@ -808,7 +937,7 @@ fn mask_normalize_ce<B: Backend>(
 ))]
 impl<B> TrainStep for Gemma2ForSFT<B>
 where
-    B: AutodiffBackend + crate::fused_ops::FusedCEBackend,
+    B: AutodiffBackend + crate::fused_ops::FusedCEBackend + crate::fused_ops::FusedLoraMLPBackend,
 {
     type Input = SFTTrainingBatch<B>;
     type Output = SequenceOutput<B>;
@@ -818,9 +947,10 @@ where
         let mask_pad = batch.mask_pad;
 
         if !self.no_fused_ce {
-            // Fused CE path: sc(x) + log_softmax + gather + neg in ONE GPU kernel.
-            // Use forward_raw() to skip softcapping — it's fused into the CE kernel.
-            let logits = self.model.forward_raw(batch.tokens_inputs);
+            // Fused CE + fused LoRA MLP path: both use single GPU kernel dispatches.
+            // forward_raw_fused() uses fused LoRA MLP kernel (1 backward step per block
+            // instead of ~15), forward_raw() skips softcapping (fused into CE kernel).
+            let logits = self.model.forward_raw_fused(batch.tokens_inputs);
             let [batch_size, seq_len, vocab_size] = logits.dims();
 
             // Softcap value from model config (Gemma 2 2B = 30.0).

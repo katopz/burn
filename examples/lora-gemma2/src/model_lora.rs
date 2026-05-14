@@ -26,7 +26,7 @@
 //! let targets = LoraTarget::all_targets();
 //! let lora_model = apply_lora_to_gemma2(model, &lora_config, targets, &device);
 //!
-//! let sft_model = Gemma2ForSFT::new(lora_model, 0);
+//! let sft_model = Gemma2ForSFT::new(lora_model, 0, false);
 //! // ... train with burn's Learner ...
 //! let merged = sft_model.model.merge();
 //! ```
@@ -705,7 +705,7 @@ fn wrap_lora<B: Backend>(
 /// use lora_gemma2::model_lora::{apply_lora_to_gemma2, Gemma2ForSFT};
 ///
 /// let lora_model = apply_lora_to_gemma2(model, &lora_config, targets, &device);
-/// let sft_model = Gemma2ForSFT::new(lora_model, pad_token_id);
+/// let sft_model = Gemma2ForSFT::new(lora_model, pad_token_id, false);
 ///
 /// // Use with burn's Learner
 /// let result = training.launch(Learner::new(sft_model, optimizer, lr));
@@ -717,14 +717,18 @@ pub struct Gemma2ForSFT<B: Backend> {
     pub model: Gemma2ModelLora<B>,
     /// Pad token ID to ignore in cross-entropy loss.
     pub pad_token_id: usize,
+    /// If true, use standard CE (log_softmax → gather → neg) instead of fused CE kernel.
+    /// Useful for benchmarking fused vs standard CE on cubecl backends.
+    pub no_fused_ce: bool,
 }
 
 impl<B: Backend> Gemma2ForSFT<B> {
     /// Create a new SFT training wrapper.
-    pub fn new(model: Gemma2ModelLora<B>, pad_token_id: usize) -> Self {
+    pub fn new(model: Gemma2ModelLora<B>, pad_token_id: usize, no_fused_ce: bool) -> Self {
         Self {
             model,
             pad_token_id,
+            no_fused_ce,
         }
     }
 
@@ -749,6 +753,7 @@ impl<B: Backend> ModuleDisplay for Gemma2ForSFT<B> {
     fn custom_content(&self, content: Content) -> Option<Content> {
         content
             .add("pad_token_id", &self.pad_token_id)
+            .add("no_fused_ce", &self.no_fused_ce)
             .add("model", &self.model)
             .optional()
     }
@@ -758,20 +763,6 @@ impl<B: Backend> ModuleDisplay for Gemma2ForSFT<B> {
 // TrainStep / InferenceStep
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// TrainStep — fused CE loss path (cubecl backends: metal, wgpu, cuda, vulkan, rocm)
-// ---------------------------------------------------------------------------
-
-/// Fused cross-entropy TrainStep for cubecl GPU backends.
-///
-/// Replaces the standard CE tensor op chain (log_softmax → gather → neg → mask_fill)
-/// with a single fused GPU kernel, avoiding materialization of the
-/// `[batch*seq, 256K]` log_probs tensor (~4GB for seq=2048).
-///
-/// The backward pass also uses a single fused kernel (softmax + gradient),
-/// replacing ~10 autodiff backward steps with 1 GPU dispatch.
-///
-/// Reference: `unsloth/kernels/cross_entropy_loss.py` Fast_CrossEntropyLoss
 // ---------------------------------------------------------------------------
 // TrainStep / InferenceStep
 // ---------------------------------------------------------------------------
@@ -789,18 +780,22 @@ fn mask_normalize_ce<B: Backend>(
     let [batch_size, seq_len] = token_losses.dims();
     let device = token_losses.device();
     let masked_ce = token_losses.mask_fill(mask_pad.clone(), 0);
+    // Keep ntokens in same dtype as token_losses to avoid DTypeMismatch
+    // in autodiff backward when dividing f16 sum / f32 ntokens.
     let ntokens = Tensor::<B, 2>::ones([batch_size, seq_len], &device)
-        .cast(FloatDType::F32)
         .mask_fill(mask_pad, 0)
         .sum();
     masked_ce.sum() / ntokens
 }
 
-/// Fused CE TrainStep for cubecl GPU backends (metal, wgpu, cuda, vulkan, rocm).
+/// TrainStep for cubecl GPU backends (metal, wgpu, cuda, vulkan, rocm).
 ///
-/// Replaces `log_softmax → gather → neg` (10+ autodiff backward steps)
-/// with a single fused GPU kernel (1 forward + 1 backward dispatch).
-/// Avoids materializing `[batch*seq, 256K]` log_probs (~4GB for seq=2048).
+/// Supports two CE paths selected at runtime via `no_fused_ce`:
+/// - `false` (default): Fused CE with inline softcapping (single GPU kernel).
+///   Replaces `log_softmax → gather → neg` (10+ autodiff backward steps)
+///   with a single fused GPU kernel (1 forward + 1 backward dispatch).
+///   Avoids materializing `[batch*seq, 256K]` log_probs (~4GB for seq=2048).
+/// - `true`: Standard CE (log_softmax → gather → neg) with f32 cast.
 ///
 /// NOTE: Requires `B: FusedCEBackend` — the caller's `run()` function must
 /// propagate this bound. See `sft-train.rs` for the matching cfg-conditional bounds.
@@ -819,36 +814,62 @@ where
     type Output = SequenceOutput<B>;
 
     fn step(&self, batch: SFTTrainingBatch<B>) -> TrainOutput<SequenceOutput<B>> {
-        // Use forward_raw() to skip softcapping — it's fused into the CE kernel.
-        // This avoids materializing the [batch*seq, 256K] softcapped logits tensor.
-        let logits = self.model.forward_raw(batch.tokens_inputs);
         let targets = batch.targets;
-        let [batch_size, seq_len, vocab_size] = logits.dims();
+        let mask_pad = batch.mask_pad;
 
-        // Fused CE with inline softcapping: sc(x) + log_softmax + gather + neg
-        // in ONE GPU kernel. Softcap value from model config (Gemma 2 2B = 30.0).
-        //
-        // NOTE: Runs in native f16 (no f32 cast). Softcapping bounds logits to
-        // [-30, 30] which keeps logsumexp numerically stable in f16. This avoids
-        // materializing the [batch*seq, 256K] f32 tensor (~4GB savings for seq=2048).
-        let softcap = Some(self.model.final_logit_softcapping as f32);
-        let logits_flat = logits.clone().reshape([batch_size * seq_len, vocab_size]);
-        let targets_flat = targets.clone().reshape([batch_size * seq_len]);
-        let token_losses = crate::fused_ops::fused_ce_loss::<B>(logits_flat, targets_flat, softcap)
-            .reshape([batch_size, seq_len]);
+        if !self.no_fused_ce {
+            // Fused CE path: sc(x) + log_softmax + gather + neg in ONE GPU kernel.
+            // Use forward_raw() to skip softcapping — it's fused into the CE kernel.
+            let logits = self.model.forward_raw(batch.tokens_inputs);
+            let [batch_size, seq_len, vocab_size] = logits.dims();
 
-        let loss = mask_normalize_ce(token_losses, batch.mask_pad.clone());
+            // Softcap value from model config (Gemma 2 2B = 30.0).
+            // Runs in native f16 (no f32 cast). Softcapping bounds logits to
+            // [-30, 30] which keeps logsumexp numerically stable in f16.
+            let softcap = Some(self.model.final_logit_softcapping as f32);
+            let logits_flat = logits.clone().reshape([batch_size * seq_len, vocab_size]);
+            let targets_flat = targets.clone().reshape([batch_size * seq_len]);
+            let token_losses =
+                crate::fused_ops::fused_ce_loss::<B>(logits_flat, targets_flat, softcap)
+                    .reshape([batch_size, seq_len]);
 
-        // NOTE: Do NOT call loss.into_scalar() — GPU sync costs ~800ms/iter.
-        TrainOutput::new(
-            self,
-            loss.backward(),
-            SequenceOutput::new(loss, logits, None, targets),
-        )
+            let loss = mask_normalize_ce(token_losses, mask_pad);
+
+            // NOTE: Do NOT call loss.into_scalar() — GPU sync costs ~800ms/iter.
+            TrainOutput::new(
+                self,
+                loss.backward(),
+                SequenceOutput::new(loss, logits, None, targets),
+            )
+        } else {
+            // Standard CE path: log_softmax → gather → neg (for benchmarking).
+            // Use native dtype (no f32 cast) to avoid DTypeMismatch in autodiff backward
+            // when running on f16 Metal backend. The fused CE kernel avoids this issue
+            // by operating entirely in f16 with softcapping for numerical stability.
+            let logits = self.model.forward(batch.tokens_inputs);
+            let [batch_size, seq_len, _vocab_size] = logits.dims();
+
+            let target_indices = targets.clone().reshape([batch_size, seq_len, 1]);
+            let token_losses = log_softmax(logits.clone(), 2)
+                .gather(2, target_indices)
+                .reshape([batch_size, seq_len])
+                .neg();
+
+            let loss = mask_normalize_ce(token_losses, mask_pad);
+
+            TrainOutput::new(
+                self,
+                loss.backward(),
+                SequenceOutput::new(loss, logits, None, targets),
+            )
+        }
     }
 }
 
 /// Standard CE TrainStep for non-cubecl backends (ndarray, tch).
+///
+/// These backends lack the fused CE kernel, so they always use the standard
+/// `log_softmax → gather → neg` path regardless of the `no_fused_ce` flag.
 #[cfg(not(any(
     feature = "metal",
     feature = "wgpu",
@@ -1387,7 +1408,7 @@ mod tests {
         let lora_model =
             apply_lora_to_gemma2(model, &lora_config, LoraTarget::all_targets(), &device);
 
-        let sft_model = Gemma2ForSFT::new(lora_model, 0);
+        let sft_model = Gemma2ForSFT::new(lora_model, 0, false);
 
         let input = Tensor::<TestBackend, 2, Int>::zeros([1, 4], &device);
         let output = sft_model.forward(input);
@@ -1408,7 +1429,7 @@ mod tests {
         let lora_model =
             apply_lora_to_gemma2(model, &lora_config, LoraTarget::all_targets(), &device);
 
-        let sft_model = Gemma2ForSFT::new(lora_model, 0);
+        let sft_model = Gemma2ForSFT::new(lora_model, 0, false);
         let merged = sft_model.merge();
 
         let input = Tensor::<TestBackend, 2, Int>::zeros([1, 4], &device);

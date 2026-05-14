@@ -105,7 +105,7 @@ fn make_batch(
 fn test_train_step_produces_loss_and_grads() {
     let device = device();
     let lora_model = make_lora_model();
-    let sft_model = Gemma2ForSFT::new(lora_model, 0);
+    let sft_model = Gemma2ForSFT::new(lora_model, 0, false);
 
     let _batch = make_batch(2, 8, &device);
     let output = <Gemma2ForSFT<TestAD> as TrainStep>::step(&sft_model, make_batch(2, 8, &device));
@@ -132,7 +132,7 @@ fn test_train_step_produces_loss_and_grads() {
 fn test_inference_step_produces_loss() {
     let device = device();
     let lora_model = make_lora_model();
-    let sft_model = Gemma2ForSFT::new(lora_model, 0);
+    let sft_model = Gemma2ForSFT::new(lora_model, 0, false);
 
     let batch = make_batch(2, 8, &device);
     let output = <Gemma2ForSFT<TestAD> as InferenceStep>::step(&sft_model, batch);
@@ -160,7 +160,7 @@ fn test_inference_step_produces_loss() {
 fn test_training_reduces_loss() {
     let device = device();
     let lora_model = make_lora_model();
-    let sft_model = Gemma2ForSFT::new(lora_model, 0);
+    let sft_model = Gemma2ForSFT::new(lora_model, 0, false);
 
     let mut optimizer = AdamConfig::new().init();
     let lr = 1e-3;
@@ -218,7 +218,7 @@ fn test_training_reduces_loss() {
 fn test_merge_after_training() {
     let device = device();
     let lora_model = make_lora_model();
-    let sft_model = Gemma2ForSFT::new(lora_model, 0);
+    let sft_model = Gemma2ForSFT::new(lora_model, 0, false);
 
     let mut optimizer = AdamConfig::new().init();
     let lr = 1e-3;
@@ -266,7 +266,7 @@ fn test_adapter_save_load_after_training() {
     let lora_config = LoraConfig::new(4).with_alpha(8.0).with_bias(LoraBias::None);
     let model = Gemma2Model::<TestAD>::new(&config, &device);
     let lora_model = apply_lora_to_gemma2(model, &lora_config, LoraTarget::all_targets(), &device);
-    let sft_model = Gemma2ForSFT::new(lora_model, 0);
+    let sft_model = Gemma2ForSFT::new(lora_model, 0, false);
 
     let mut optimizer = AdamConfig::new().init();
     let lr = 1e-3;
@@ -440,7 +440,7 @@ fn test_param_counts_attention_only() {
 fn test_gradient_flow_only_lora() {
     let device = device();
     let lora_model = make_lora_model();
-    let sft_model = Gemma2ForSFT::new(lora_model, 0);
+    let sft_model = Gemma2ForSFT::new(lora_model, 0, false);
 
     let batch = make_batch(2, 8, &device);
     let output = <Gemma2ForSFT<TestAD> as TrainStep>::step(&sft_model, batch);
@@ -475,7 +475,7 @@ fn test_supervised_training_runs() {
 
     let lora_config = LoraConfig::new(4).with_alpha(8.0);
     let lora_model = apply_lora_to_gemma2(model, &lora_config, LoraTarget::all_targets(), &device);
-    let sft_model = Gemma2ForSFT::new(lora_model, 0);
+    let sft_model = Gemma2ForSFT::new(lora_model, 0, false);
 
     // Create synthetic dataset items
     use lora_gemma2::dataset::{ChatItem, ChatMessageSerde};

@@ -45,6 +45,7 @@
 //! | `--max-duration` | (none) | Max training duration in seconds (unlimited if not set) |
 //! | `--max-ram` | (none) | Max RAM usage in GB, stops training if exceeded (macOS only) |
 //! | `--warmup-steps` | `0` | Linear LR warmup steps before cosine decay (0 = no warmup) |
+//! | `--no-fused-ce` | `false` | Disable fused CE kernel, use standard CE for benchmarking |
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -122,6 +123,8 @@ struct SftArgs {
     max_ram: Option<f64>,
     /// Linear LR warmup steps before cosine decay (0 = no warmup).
     warmup_steps: usize,
+    /// Disable fused CE kernel, use standard CE for benchmarking (cubecl only).
+    no_fused_ce: bool,
 }
 
 impl SftArgs {
@@ -148,6 +151,7 @@ impl SftArgs {
             max_duration: None,
             max_ram: None,
             warmup_steps: 0,
+            no_fused_ce: false,
         };
 
         let cli: Vec<String> = std::env::args().collect();
@@ -303,6 +307,10 @@ impl SftArgs {
                         .expect("invalid warmup-steps");
                     i += 2;
                 }
+                "--no-fused-ce" => {
+                    args.no_fused_ce = true;
+                    i += 1;
+                }
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -377,6 +385,9 @@ fn print_usage() {
         "  --max-ram <GB>           Max RAM usage in GB, stops if exceeded (default: unlimited)"
     );
     eprintln!("  --warmup-steps <N>       Linear LR warmup steps (default: 0, no warmup)");
+    eprintln!(
+        "  --no-fused-ce            Disable fused CE kernel, use standard CE (default: false)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -654,7 +665,7 @@ fn run<B: SftBackend>(args: SftArgs, device: B::Device) {
     log::info!("  Scaling: {:.4}", lora_config.scaling());
 
     // Wrap for SFT training
-    let sft_model = Gemma2ForSFT::new(lora_model, pad_token_id);
+    let sft_model = Gemma2ForSFT::new(lora_model, pad_token_id, args.no_fused_ce);
 
     // -----------------------------------------------------------------------
     // 8. Setup Training

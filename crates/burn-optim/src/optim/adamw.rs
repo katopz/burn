@@ -1,7 +1,7 @@
 use burn_core as burn;
 
 use burn::config::Config;
-use burn::tensor::{Tensor, backend::AutodiffBackend};
+use burn::tensor::{FloatDType, Tensor, backend::AutodiffBackend};
 use burn::tensor::{backend::Backend, ops::Device};
 use burn::{module::AutodiffModule, record::Record};
 
@@ -37,6 +37,12 @@ pub struct AdamWConfig {
     /// Whether to use AMSGrad algorithm
     #[config(default = false)]
     amsgrad: bool,
+    /// Whether to keep optimizer states in f32 regardless of model parameter dtype.
+    ///
+    /// This improves training stability when using f16/bf16 parameters by computing
+    /// Adam moments in f32 precision.
+    #[config(default = false)]
+    mixed_precision: bool,
     /// [Gradient Clipping](GradientClippingConfig) config.
     grad_clipping: Option<GradientClippingConfig>,
 }
@@ -121,6 +127,7 @@ impl AdamWConfig {
                 beta_2: self.beta_2,
                 epsilon: self.epsilon,
                 amsgrad: self.amsgrad,
+                mixed_precision: self.mixed_precision,
             },
             weight_decay: self.weight_decay,
             cautious_weight_decay: self.cautious_weight_decay,
@@ -147,6 +154,7 @@ struct AdaptiveMomentumW {
     beta_2: f32,
     epsilon: f32,
     amsgrad: bool,
+    mixed_precision: bool,
 }
 
 impl AdaptiveMomentumW {
@@ -157,6 +165,16 @@ impl AdaptiveMomentumW {
     ) -> (Tensor<B, D>, AdaptiveMomentumState<B, D>) {
         let factor_1 = 1.0 - self.beta_1;
         let factor_2 = 1.0 - self.beta_2;
+
+        // Mixed precision: cast grad to f32, remember original dtype for later
+        let original_dtype = match self.mixed_precision {
+            true => Some(FloatDType::from(grad.dtype())),
+            false => None,
+        };
+        let grad = match original_dtype {
+            Some(FloatDType::F32) | None => grad,
+            Some(_) => grad.cast(FloatDType::F32),
+        };
 
         let state = if let Some(mut state) = state {
             // Update first moment estimate.
@@ -216,6 +234,12 @@ impl AdaptiveMomentumW {
 
         let update_delta =
             moment_1_corrected.div(moment_2_corrected.sqrt().add_scalar(self.epsilon));
+
+        // Mixed precision: cast result back to original dtype
+        let update_delta = match original_dtype {
+            Some(FloatDType::F32) | None => update_delta,
+            Some(dtype) => update_delta.cast(dtype),
+        };
 
         (update_delta, state)
     }
@@ -592,6 +616,7 @@ mod tests {
                 beta_2: config.beta_2,
                 epsilon: config.epsilon,
                 amsgrad: config.amsgrad,
+                mixed_precision: config.mixed_precision,
             },
             weight_decay: config.weight_decay,
             cautious_weight_decay: false,

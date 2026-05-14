@@ -46,6 +46,7 @@
 //! | `--max-ram` | (none) | Max RAM usage in GB, stops training if exceeded (macOS only) |
 //! | `--warmup-steps` | `0` | Linear LR warmup steps before cosine decay (0 = no warmup) |
 //! | `--no-fused-ce` | `false` | Disable fused CE kernel, use standard CE for benchmarking |
+//! | `--no-mixed-precision` | `false` | Disable f32 optimizer states (keeps moments in model dtype) |
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -125,6 +126,8 @@ struct SftArgs {
     warmup_steps: usize,
     /// Disable fused CE kernel, use standard CE for benchmarking (cubecl only).
     no_fused_ce: bool,
+    /// Disable mixed precision optimizer (keep moments in f32 regardless of model dtype).
+    no_mixed_precision: bool,
 }
 
 impl SftArgs {
@@ -152,6 +155,7 @@ impl SftArgs {
             max_ram: None,
             warmup_steps: 0,
             no_fused_ce: false,
+            no_mixed_precision: false,
         };
 
         let cli: Vec<String> = std::env::args().collect();
@@ -307,6 +311,9 @@ impl SftArgs {
                         .expect("invalid warmup-steps");
                     i += 2;
                 }
+                "--no-mixed-precision" => {
+                    args.no_mixed_precision = true;
+                }
                 "--no-fused-ce" => {
                     args.no_fused_ce = true;
                     i += 1;
@@ -387,6 +394,9 @@ fn print_usage() {
     eprintln!("  --warmup-steps <N>       Linear LR warmup steps (default: 0, no warmup)");
     eprintln!(
         "  --no-fused-ce            Disable fused CE kernel, use standard CE (default: false)"
+    );
+    eprintln!(
+        "  --no-mixed-precision     Disable f32 optimizer states (default: false, mixed precision on)"
     );
 }
 
@@ -698,7 +708,7 @@ fn run<B: SftBackend>(args: SftArgs, device: B::Device) {
     // Seed the backend
     B::seed(&device, args.seed);
 
-    let mut adam_config = AdamConfig::new();
+    let mut adam_config = AdamConfig::new().with_mixed_precision(!args.no_mixed_precision);
 
     // Wire weight decay (L2 regularization)
     if args.weight_decay > 0.0 {

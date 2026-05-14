@@ -45,7 +45,7 @@
 //! | `--max-duration` | (none) | Max training duration in seconds (unlimited if not set) |
 //! | `--max-ram` | (none) | Max RAM usage in GB, stops training if exceeded (macOS only) |
 //! | `--warmup-steps` | `0` | Linear LR warmup steps before cosine decay (0 = no warmup) |
-//! | `--no-fused-ce` | `false` | Disable fused CE kernel, use standard CE for benchmarking |
+//! | `--use-fused-ce` | `false` | Use fused CE kernel (saves ~4GB memory, slower than standard CE) |
 //! | `--no-mixed-precision` | `false` | Disable f32 optimizer states (keeps moments in model dtype) |
 
 use std::path::PathBuf;
@@ -124,8 +124,9 @@ struct SftArgs {
     max_ram: Option<f64>,
     /// Linear LR warmup steps before cosine decay (0 = no warmup).
     warmup_steps: usize,
-    /// Disable fused CE kernel, use standard CE for benchmarking (cubecl only).
-    no_fused_ce: bool,
+    /// Use fused CE kernel with inline softcapping instead of standard CE.
+    /// Default: false (standard CE is faster; fused CE saves ~4GB memory but is slower).
+    use_fused_ce: bool,
     /// Disable mixed precision optimizer (keep moments in f32 regardless of model dtype).
     no_mixed_precision: bool,
 }
@@ -154,7 +155,7 @@ impl SftArgs {
             max_duration: None,
             max_ram: None,
             warmup_steps: 0,
-            no_fused_ce: false,
+            use_fused_ce: false,
             no_mixed_precision: false,
         };
 
@@ -314,8 +315,8 @@ impl SftArgs {
                 "--no-mixed-precision" => {
                     args.no_mixed_precision = true;
                 }
-                "--no-fused-ce" => {
-                    args.no_fused_ce = true;
+                "--use-fused-ce" => {
+                    args.use_fused_ce = true;
                     i += 1;
                 }
                 "--help" | "-h" => {
@@ -392,9 +393,7 @@ fn print_usage() {
         "  --max-ram <GB>           Max RAM usage in GB, stops if exceeded (default: unlimited)"
     );
     eprintln!("  --warmup-steps <N>       Linear LR warmup steps (default: 0, no warmup)");
-    eprintln!(
-        "  --no-fused-ce            Disable fused CE kernel, use standard CE (default: false)"
-    );
+    eprintln!("  --use-fused-ce           Use fused CE kernel (saves ~4GB memory, default: false)");
     eprintln!(
         "  --no-mixed-precision     Disable f32 optimizer states (default: false, mixed precision on)"
     );
@@ -685,7 +684,7 @@ fn run<B: SftBackend>(args: SftArgs, device: B::Device) {
     log::info!("  Scaling: {:.4}", lora_config.scaling());
 
     // Wrap for SFT training
-    let sft_model = Gemma2ForSFT::new(lora_model, pad_token_id, args.no_fused_ce);
+    let sft_model = Gemma2ForSFT::new(lora_model, pad_token_id, args.use_fused_ce);
 
     // -----------------------------------------------------------------------
     // 8. Setup Training

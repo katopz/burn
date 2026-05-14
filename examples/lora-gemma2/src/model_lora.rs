@@ -855,18 +855,18 @@ pub struct Gemma2ForSFT<B: Backend> {
     pub model: Gemma2ModelLora<B>,
     /// Pad token ID to ignore in cross-entropy loss.
     pub pad_token_id: usize,
-    /// If true, use standard CE (log_softmax → gather → neg) instead of fused CE kernel.
-    /// Useful for benchmarking fused vs standard CE on cubecl backends.
-    pub no_fused_ce: bool,
+    /// If true, use fused CE kernel with inline softcapping instead of standard CE.
+    /// Default: false (standard CE is faster; fused CE saves memory but is slower).
+    pub use_fused_ce: bool,
 }
 
 impl<B: Backend> Gemma2ForSFT<B> {
     /// Create a new SFT training wrapper.
-    pub fn new(model: Gemma2ModelLora<B>, pad_token_id: usize, no_fused_ce: bool) -> Self {
+    pub fn new(model: Gemma2ModelLora<B>, pad_token_id: usize, use_fused_ce: bool) -> Self {
         Self {
             model,
             pad_token_id,
-            no_fused_ce,
+            use_fused_ce,
         }
     }
 
@@ -891,7 +891,7 @@ impl<B: Backend> ModuleDisplay for Gemma2ForSFT<B> {
     fn custom_content(&self, content: Content) -> Option<Content> {
         content
             .add("pad_token_id", &self.pad_token_id)
-            .add("no_fused_ce", &self.no_fused_ce)
+            .add("use_fused_ce", &self.use_fused_ce)
             .add("model", &self.model)
             .optional()
     }
@@ -931,12 +931,14 @@ fn mask_normalize_ce<B: Backend>(
 
 /// TrainStep for cubecl GPU backends (metal, wgpu, cuda, vulkan, rocm).
 ///
-/// Supports two CE paths selected at runtime via `no_fused_ce`:
-/// - `false` (default): Fused CE with inline softcapping (single GPU kernel).
-///   Replaces `log_softmax → gather → neg` (10+ autodiff backward steps)
-///   with a single fused GPU kernel (1 forward + 1 backward dispatch).
-///   Avoids materializing `[batch*seq, 256K]` log_probs (~4GB for seq=2048).
-/// - `true`: Standard CE (log_softmax → gather → neg) with f32 cast.
+/// Supports two CE paths selected at runtime via `use_fused_ce`:
+/// - `false` (default): Standard CE (log_softmax → gather → neg).
+///   Faster (~0.20s/iter) — burn's `log_softmax` handles f16 numerical stability.
+///   Materializes `[batch*seq, 256K]` log_probs (~4GB for seq=2048).
+/// - `true`: Fused CE with inline softcapping (single GPU kernel).
+///   Avoids materializing `[batch*seq, 256K]` log_probs (~4GB memory saved).
+///   Slower (~0.25s/iter) — f32 upcast in fused kernel adds overhead.
+///   Use when memory-constrained, not for speed.
 ///
 /// NOTE: Requires `B: FusedCEBackend` — the caller's `run()` function must
 /// propagate this bound. See `sft-train.rs` for the matching cfg-conditional bounds.
@@ -958,16 +960,19 @@ where
         let targets = batch.targets;
         let mask_pad = batch.mask_pad;
 
-        if !self.no_fused_ce {
+        if self.use_fused_ce {
             // Fused CE + fused LoRA MLP path: both use single GPU kernel dispatches.
             // forward_raw_fused() uses fused LoRA MLP kernel (1 backward step per block
             // instead of ~15), forward_raw() skips softcapping (fused into CE kernel).
+            // NOTE: Slower than standard CE due to f32 upcast overhead in fused kernel.
+            // Use only when memory-constrained (avoids [N, 256K] log_probs materialization).
             let logits = self.model.forward_raw_fused(batch.tokens_inputs);
             let [batch_size, seq_len, vocab_size] = logits.dims();
 
             // Softcap value from model config (Gemma 2 2B = 30.0).
-            // Runs in native f16 (no f32 cast). Softcapping bounds logits to
-            // [-30, 30] which keeps logsumexp numerically stable in f16.
+            // The fused CE kernel internally upcasts to f32 for the logsumexp
+            // accumulation (sum over 256K vocab overflows f16 max ~65504),
+            // then casts the loss back to the original dtype.
             let softcap = Some(self.model.final_logit_softcapping as f32);
             let logits_flat = logits.clone().reshape([batch_size * seq_len, vocab_size]);
             let targets_flat = targets.clone().reshape([batch_size * seq_len]);
@@ -984,10 +989,10 @@ where
                 SequenceOutput::new(loss, logits, None, targets),
             )
         } else {
-            // Standard CE path: log_softmax → gather → neg (for benchmarking).
-            // Use native dtype (no f32 cast) to avoid DTypeMismatch in autodiff backward
-            // when running on f16 Metal backend. The fused CE kernel avoids this issue
-            // by operating entirely in f16 with softcapping for numerical stability.
+            // Standard CE path: log_softmax → gather → neg (default, faster).
+            // burn's log_softmax handles f16 numerical stability internally.
+            // Materializes [batch*seq, 256K] log_probs (~4GB for seq=2048) but
+            // ~20% faster than fused CE with f32 upcast.
             let logits = self.model.forward(batch.tokens_inputs);
             let [batch_size, seq_len, _vocab_size] = logits.dims();
 
@@ -1011,7 +1016,7 @@ where
 /// Standard CE TrainStep for non-cubecl backends (ndarray, tch).
 ///
 /// These backends lack the fused CE kernel, so they always use the standard
-/// `log_softmax → gather → neg` path regardless of the `no_fused_ce` flag.
+/// `log_softmax → gather → neg` path regardless of the `use_fused_ce` flag.
 #[cfg(not(any(
     feature = "metal",
     feature = "wgpu",

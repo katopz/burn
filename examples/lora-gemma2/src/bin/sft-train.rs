@@ -890,6 +890,7 @@ fn main() {
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    use burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing;
     use burn::backend::{Autodiff, Metal};
     use burn::tensor::f16;
 
@@ -906,7 +907,10 @@ fn main() {
     // If training quality matters more than speed, switch to f32:
     //   type Backend = Metal<f32, i64>;  // ~22s/iter, stable loss
     type Backend = Metal<f16, i64>; // ~3-4s/iter, loss spikes but 5x faster
-    type AD = Autodiff<Backend>;
+    // BalancedCheckpointing: memory-bound ops recompute during backward instead of
+    // saving all intermediates. Reduces peak memory ~30-50% at cost of ~10% more compute.
+    // Default (NoCheckpointing) stores every intermediate tensor — ~2x peak memory.
+    type AD = Autodiff<Backend, BalancedCheckpointing>;
 
     let args = SftArgs::parse();
     let device = Default::default();

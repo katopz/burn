@@ -33,9 +33,9 @@
 //! - `unsloth/kernels/cross_entropy_loss.py` — Triton kernel adapted from
 //! - `burn/crates/burn-cubecl/src/kernel/ctc.rs` — shared memory patterns
 
-use burn_backend::{Shape, TensorMetadata};
+use burn_backend::{DType, Shape, TensorMetadata};
 use burn_cubecl::CubeRuntime;
-use burn_cubecl::kernel::into_contiguous;
+use burn_cubecl::kernel::{cast, into_contiguous};
 use burn_cubecl::ops::numeric::empty_device_dtype;
 use burn_cubecl::tensor::CubeTensor;
 use cubecl::prelude::*;
@@ -474,16 +474,26 @@ pub fn fused_ce_forward<R: CubeRuntime>(
     targets: CubeTensor<R>,
     softcap: Option<f32>,
 ) -> (CubeTensor<R>, CubeTensor<R>) {
-    let logits = into_contiguous(logits);
+    // Save original dtype for casting loss back after kernel.
+    let original_dtype = logits.dtype;
+
+    // Cast to f32 for numerical stability. The logsumexp accumulation
+    // sums exp() over the full vocab dimension (256K for Gemma 2), which
+    // overflows f16 (max ~65504). Computing in f32 avoids this.
+    let logits = into_contiguous(if original_dtype != DType::F32 {
+        cast(logits, DType::F32)
+    } else {
+        logits
+    });
     let targets = into_contiguous(targets);
 
     let [n_rows, _vocab_size] = logits.shape().dims::<2>();
     let client = logits.client.clone();
     let device = logits.device.clone();
-    let f_dtype = logits.dtype;
+    let f_dtype = logits.dtype; // Always f32 after cast above
     let i_dtype = targets.dtype;
 
-    let loss = empty_device_dtype::<R>(
+    let loss_f32 = empty_device_dtype::<R>(
         client.clone(),
         device.clone(),
         Shape::new([n_rows]),
@@ -510,12 +520,19 @@ pub fn fused_ce_forward<R: CubeRuntime>(
         cube_dim,
         logits.into_tensor_arg(),
         targets.into_tensor_arg(),
-        loss.clone().into_tensor_arg(),
+        loss_f32.clone().into_tensor_arg(),
         logsumexp.clone().into_tensor_arg(),
         block_size,
         do_softcap,
         [f_dtype.into(), i_dtype.into()],
     );
+
+    // Cast loss back to original dtype. Logsumexp stays f32 for backward.
+    let loss = if original_dtype != DType::F32 {
+        cast(loss_f32, original_dtype)
+    } else {
+        loss_f32
+    };
 
     (loss, logsumexp)
 }
@@ -539,18 +556,32 @@ pub fn fused_ce_backward<R: CubeRuntime>(
     targets: CubeTensor<R>,
     softcap: Option<f32>,
 ) -> CubeTensor<R> {
-    let logits = into_contiguous(logits);
-    let grad_loss = into_contiguous(grad_loss);
+    // Save original dtype for casting grad_logits back after kernel.
+    let original_dtype = logits.dtype;
+
+    // Cast to f32 to match forward (logsumexp is f32 from forward).
+    // Also avoids f16 precision loss in softmax gradient computation.
+    let logits = into_contiguous(if original_dtype != DType::F32 {
+        cast(logits, DType::F32)
+    } else {
+        logits
+    });
+    let grad_loss = into_contiguous(if original_dtype != DType::F32 {
+        cast(grad_loss, DType::F32)
+    } else {
+        grad_loss
+    });
+    // logsumexp is already f32 from forward, just ensure contiguous.
     let logsumexp = into_contiguous(logsumexp);
     let targets = into_contiguous(targets);
 
     let [n_rows, vocab_size] = logits.shape().dims::<2>();
     let client = logits.client.clone();
     let device = logits.device.clone();
-    let f_dtype = logits.dtype;
+    let f_dtype = logits.dtype; // Always f32 after cast above
     let i_dtype = targets.dtype;
 
-    let grad_logits = empty_device_dtype::<R>(
+    let grad_logits_f32 = empty_device_dtype::<R>(
         client.clone(),
         device.clone(),
         Shape::new([n_rows, vocab_size]),
@@ -573,11 +604,16 @@ pub fn fused_ce_backward<R: CubeRuntime>(
         grad_loss.into_tensor_arg(),
         logsumexp.into_tensor_arg(),
         targets.into_tensor_arg(),
-        grad_logits.clone().into_tensor_arg(),
+        grad_logits_f32.clone().into_tensor_arg(),
         block_size,
         do_softcap,
         [f_dtype.into(), i_dtype.into()],
     );
 
-    grad_logits
+    // Cast gradient back to original dtype for downstream ops.
+    if original_dtype != DType::F32 {
+        cast(grad_logits_f32, original_dtype)
+    } else {
+        grad_logits_f32
+    }
 }

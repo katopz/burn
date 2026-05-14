@@ -377,10 +377,12 @@ where
             dtype: out_dtype,
             status: TensorStatus::NotInit,
         };
+        // Logsumexp stays f32 — fused_ce_forward upcasts to f32 internally
+        // and returns logsumexp as f32 (only loss is cast back to original dtype).
         let lse_ir = burn_ir::TensorIr {
             id: logsumexp_id,
             shape: out_shape,
-            dtype: out_dtype,
+            dtype: burn::tensor::DType::F32,
             status: TensorStatus::NotInit,
         };
 

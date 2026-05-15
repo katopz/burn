@@ -3,6 +3,7 @@
 //! Uses a tiny model configuration (small vocab, 2 layers) to validate
 //! the training pipeline end-to-end without requiring real weights.
 
+#[cfg(feature = "metal")]
 use burn::module::{AutodiffModule, Module, Quantizer};
 use burn::nn::lora::{LoraBias, LoraConfig};
 use burn::optim::AdamConfig;
@@ -10,6 +11,7 @@ use burn::prelude::*;
 #[allow(unused_imports)] // Tolerance used in ndarray-only tests, imported in all builds
 use burn::tensor::Tolerance;
 
+#[cfg(feature = "metal")]
 use burn::tensor::quantization::{Calibration, QuantLevel, QuantScheme, QuantValue};
 use burn::train::{InferenceStep, TrainStep};
 use burn_ndarray::{NdArray, NdArrayDevice};

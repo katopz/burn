@@ -51,8 +51,13 @@ pub fn compute_range<B: Backend>(
                     blocks_max = B::float_max_dim(blocks_max, dim);
                 }
 
-                // Result shape = [num_blocks_0, num_blocks_1, ...] = params_shape
-                (blocks_min, blocks_max)
+                // Squeeze unit dims from reductions to match expected params_shape
+                // (float_min_dim/float_max_dim keep reduced dim as size-1)
+                let out_shape = params_shape(&shape, QuantLevel::Block(block_size));
+                (
+                    B::float_reshape(blocks_min, out_shape.clone()),
+                    B::float_reshape(blocks_max, out_shape),
+                )
             }
         },
     }

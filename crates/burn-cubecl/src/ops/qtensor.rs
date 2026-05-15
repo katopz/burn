@@ -144,7 +144,10 @@ fn new_quantized<R: CubeRuntime>(
         metadata: Metadata::new(scales_shape, scales_strides),
         dtype: scales_dtype,
     };
-    let qparams = QParams { scales, biases: None };
+    let qparams = QParams {
+        scales,
+        biases: None,
+    };
 
     CubeTensor::new_quantized(
         client,
@@ -201,7 +204,7 @@ where
         scheme: &QuantScheme,
         qparams: QuantizationParametersPrimitive<Self>,
     ) -> QuantizedTensor<Self> {
-        kernel::quantization::quantize(tensor, scheme, qparams.scales)
+        kernel::quantization::quantize(tensor, scheme, qparams.scales, qparams.biases)
     }
 
     fn dequantize(tensor: QuantizedTensor<Self>, dtype: FloatDType) -> FloatTensor<Self> {

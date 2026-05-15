@@ -415,7 +415,10 @@ pub fn q_reshape<R: CubeRuntime>(mut tensor: CubeTensor<R>, shape: Shape) -> Cub
             let qparams = tensor.qparams.as_mut().unwrap();
 
             *tensor.meta = Metadata::new(shape, strides);
-            qparams.scales.metadata = Metadata::new(shape_scales, scales_strides);
+            qparams.scales.metadata = Metadata::new(shape_scales.clone(), scales_strides.clone());
+            if let Some(biases) = &mut qparams.biases {
+                biases.metadata = Metadata::new(shape_scales, scales_strides);
+            }
         }
         (ReshapeAction::UpdateStrides { strides }, ReshapeAction::NoChange) => {
             *tensor.meta = Metadata::new(shape, strides);
@@ -428,7 +431,10 @@ pub fn q_reshape<R: CubeRuntime>(mut tensor: CubeTensor<R>, shape: Shape) -> Cub
         ) => {
             let qparams = tensor.qparams.as_mut().unwrap();
 
-            qparams.scales.metadata = Metadata::new(shape_scales, scales_strides);
+            qparams.scales.metadata = Metadata::new(shape_scales.clone(), scales_strides.clone());
+            if let Some(biases) = &mut qparams.biases {
+                biases.metadata = Metadata::new(shape_scales, scales_strides);
+            }
         }
         // Any action to recompute
         (ReshapeAction::Recompute, _) | (_, ReshapeAction::Recompute) => {
@@ -447,7 +453,10 @@ pub fn q_reshape<R: CubeRuntime>(mut tensor: CubeTensor<R>, shape: Shape) -> Cub
             let qparams = tensor.qparams.as_mut().unwrap();
 
             let strides = contiguous_strides(&shape_scales);
-            qparams.scales.metadata = Metadata::new(shape_scales, strides);
+            qparams.scales.metadata = Metadata::new(shape_scales.clone(), strides.clone());
+            if let Some(biases) = &mut qparams.biases {
+                biases.metadata = Metadata::new(shape_scales, strides);
+            }
         }
         (ReshapeAction::NoChange, ReshapeAction::NoChange) => {}
     }

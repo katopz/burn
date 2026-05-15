@@ -1,5 +1,4 @@
 use crate::CubeRuntime;
-use crate::ops::numeric::empty_device_dtype;
 use crate::{ops::empty_qtensor_optimized, tensor::CubeTensor};
 use burn_backend::{TensorMetadata, quantization::QuantScheme};
 use cubecl::quant::scheme::QuantMode;
@@ -21,17 +20,10 @@ where
     // Extract bias binding before creating out_bias to avoid borrow conflicts
     let bias_binding = bias.map(|b| b.binding());
 
-    // For affine mode, allocate a separate output buffer for biases (same shape as scales)
+    // For affine mode, use the pre-allocated bias space in the QParams handle
+    // (allocated by new_quantized when scheme.mode == QuantMode::Affine)
     let out_bias = match (&bias_binding, scheme.mode) {
-        (Some(_), QuantMode::Affine) => {
-            let bias_out = empty_device_dtype::<R>(
-                out_params.client.clone(),
-                out_params.device.clone(),
-                out_params.shape().clone(),
-                out_params.dtype,
-            );
-            Some(bias_out.binding())
-        }
+        (Some(_), QuantMode::Affine) => output.biases().map(|b| b.binding()),
         _ => None,
     };
 

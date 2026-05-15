@@ -3,7 +3,7 @@ use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 use burn_core::module::ParamId;
-use burn_tensor::quantization::{QPARAM_ALIGN, QuantParam, params_shape};
+use burn_tensor::quantization::{QPARAM_ALIGN, QuantMode, QuantParam, params_shape};
 use burn_tensor::{Bool, DType, Int, Shape, Tensor, TensorData, backend::Backend};
 use half::f16;
 
@@ -262,9 +262,13 @@ impl TensorSnapshot {
                 let num_params = params_shape(&self.shape, scheme.level).num_elements();
 
                 let aligned_value_bytes = value_bytes.div_ceil(QPARAM_ALIGN) * QPARAM_ALIGN;
-                let scale_bytes = num_params * quant_param_size(scheme.param);
+                let param_bytes = num_params * quant_param_size(scheme.param);
+                let bias_bytes = match scheme.mode {
+                    QuantMode::Affine => param_bytes,
+                    QuantMode::Symmetric => 0,
+                };
 
-                aligned_value_bytes + scale_bytes
+                aligned_value_bytes + bias_bytes + param_bytes
             }
             _ => num_elements * self.dtype.size(),
         }

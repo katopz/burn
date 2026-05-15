@@ -71,6 +71,7 @@ fn new_quantized<R: CubeRuntime>(
     let client = R::client(device);
     let shape: Shape = shape.into();
     let mut shape_value: Shape = shape.clone();
+    let is_affine = scheme.mode == QuantMode::Affine;
 
     let rank = shape.rank();
     let shape_last = shape[rank - 1];
@@ -117,8 +118,44 @@ fn new_quantized<R: CubeRuntime>(
     let scales_desc =
         MemoryLayoutDescriptor::new(alloc_kind, scales_shape.clone(), scales_dtype.size());
 
-    let mut tensors = match data {
-        Some(data) => {
+    // For affine mode, biases have the same shape/dtype as scales
+    let biases_desc = is_affine.then(|| {
+        MemoryLayoutDescriptor::new(alloc_kind, scales_shape.clone(), scales_dtype.size())
+    });
+
+    // Allocate tensors: [data, biases?, scales]
+    // Serialization format: [values | biases | scales] (scales always last)
+    let mut tensors = match (data, is_affine) {
+        // Affine with data: [values | biases | scales]
+        (Some(data), true) => {
+            let num_bytes = shape_value.num_elements() * data_size;
+            let params_bytes = scales_shape.num_elements() * scales_dtype.size();
+
+            match data.split(num_bytes) {
+                Ok((bytes_data, bytes_params)) => match bytes_params.split(params_bytes) {
+                    Ok((bytes_biases, bytes_scales)) => client.create_tensors(vec![
+                        (data_desc, bytes_data),
+                        (biases_desc.unwrap(), bytes_biases),
+                        (scales_desc, bytes_scales),
+                    ]),
+                    Err((params, _)) => client.create_tensors_from_slices(vec![
+                        (data_desc, &bytes_data),
+                        (biases_desc.unwrap(), &params[..params_bytes]),
+                        (scales_desc, &params[params_bytes..]),
+                    ]),
+                },
+                Err((data, _)) => client.create_tensors_from_slices(vec![
+                    (data_desc, &data[..num_bytes]),
+                    (
+                        biases_desc.unwrap(),
+                        &data[num_bytes..num_bytes + params_bytes],
+                    ),
+                    (scales_desc, &data[num_bytes + params_bytes..]),
+                ]),
+            }
+        }
+        // Symmetric with data: [values | scales]
+        (Some(data), false) => {
             let num_bytes = shape_value.num_elements() * data_size;
 
             match data.split(num_bytes) {
@@ -130,12 +167,33 @@ fn new_quantized<R: CubeRuntime>(
                 ]),
             }
         }
-        None => client.empty_tensors(vec![data_desc, scales_desc]),
+        // Affine empty: allocate data + biases + scales
+        (None, true) => client.empty_tensors(vec![data_desc, biases_desc.unwrap(), scales_desc]),
+        // Symmetric empty: allocate data + scales
+        (None, false) => client.empty_tensors(vec![data_desc, scales_desc]),
     };
+
+    // Extract tensors in reverse order: scales (last), biases (middle), data (first)
     let MemoryLayout {
         memory: scales_handle,
         strides: scales_strides,
-    } = tensors.remove(1);
+    } = tensors.remove(if is_affine { 2 } else { 1 });
+
+    let biases_param = if is_affine {
+        let MemoryLayout {
+            memory: biases_handle,
+            strides: biases_strides,
+        } = tensors.remove(1);
+        Some(QParamTensor {
+            offset_start: biases_handle.offset_start.unwrap_or(0) as usize,
+            offset_end: biases_handle.offset_end.unwrap_or(0) as usize,
+            metadata: Metadata::new(scales_shape.clone(), biases_strides),
+            dtype: scales_dtype,
+        })
+    } else {
+        None
+    };
+
     let MemoryLayout { memory, strides } = tensors.remove(0);
 
     let scales = QParamTensor {
@@ -146,7 +204,7 @@ fn new_quantized<R: CubeRuntime>(
     };
     let qparams = QParams {
         scales,
-        biases: None,
+        biases: biases_param,
     };
 
     CubeTensor::new_quantized(
@@ -229,12 +287,17 @@ where
         }
 
         let (shape, dtype) = (tensor.shape(), tensor.dtype);
-        let (values, params) = tensor.quantized_handles().unwrap();
+        let (values, scales) = tensor.quantized_handles().unwrap();
 
         let mut data_values = into_data(values).await?;
-        let data_params = into_data(params).await?;
+        let data_scales = into_data(scales).await?;
 
-        data_values.bytes.extend_from_byte_slice(&data_params.bytes);
+        // Serialization format: [values | biases | scales] for affine, [values | scales] for symmetric
+        if let Some(biases) = tensor.biases() {
+            let data_biases = into_data(biases).await?;
+            data_values.bytes.extend_from_byte_slice(&data_biases.bytes);
+        }
+        data_values.bytes.extend_from_byte_slice(&data_scales.bytes);
 
         Ok(TensorData {
             bytes: data_values.bytes,

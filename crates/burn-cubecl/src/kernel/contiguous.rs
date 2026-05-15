@@ -1,5 +1,5 @@
 use burn_backend::{DType, QTensorPrimitive, TensorMetadata};
-use cubecl::quant::scheme::{QuantStore, QuantValue};
+use cubecl::quant::scheme::{QuantMode, QuantStore, QuantValue};
 use cubecl::server::MemoryLayoutStrategy;
 
 use crate::{CubeRuntime, ops::empty_qtensor, tensor::CubeTensor};
@@ -112,6 +112,18 @@ fn into_contiguous_quantized<R: CubeRuntime>(
         out_scales.binding(),
         dtype_scales.into(),
     );
+
+    // Copy biases for affine quantization
+    if scheme.mode == QuantMode::Affine
+        && let (Some(biases), Some(out_biases)) = (tensor.biases(), output.biases())
+    {
+        cubecl::std::tensor::copy_into(
+            &client,
+            biases.binding(),
+            out_biases.binding(),
+            dtype_scales.into(),
+        );
+    }
 
     output
 }

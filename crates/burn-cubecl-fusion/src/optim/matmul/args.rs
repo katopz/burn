@@ -463,7 +463,7 @@ fn create_quant_view<E: Numeric, N: Size, Q: Scalar, S: Scalar>(
         View::new::<GlobalInput, Coords1d>(&data_buf, data_layout);
     let scales_view: View<S, BatchedCoords> =
         View::new::<GlobalInput, Coords1d>(&scales_buf, scales_layout);
-    QuantizedView::new(data_view, scales_view, scheme).view()
+    QuantizedView::new(data_view, scales_view, scales_view, scheme).view()
 }
 
 #[derive(CubeType)]

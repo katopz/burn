@@ -3,10 +3,14 @@
 //! Uses a tiny model configuration (small vocab, 2 layers) to validate
 //! the training pipeline end-to-end without requiring real weights.
 
+use burn::module::{AutodiffModule, Module, Quantizer};
 use burn::nn::lora::{LoraBias, LoraConfig};
 use burn::optim::AdamConfig;
 use burn::prelude::*;
+#[allow(unused_imports)] // Tolerance used in ndarray-only tests, imported in all builds
 use burn::tensor::Tolerance;
+
+use burn::tensor::quantization::{Calibration, QuantLevel, QuantScheme, QuantValue};
 use burn::train::{InferenceStep, TrainStep};
 use burn_ndarray::{NdArray, NdArrayDevice};
 
@@ -516,4 +520,141 @@ fn test_supervised_training_runs() {
 
     // Training should complete without errors and produce finite loss
     assert!(last_loss.is_finite(), "Final loss should be finite");
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Quantized Weights Forward + Backward (GPU backends only)
+// ---------------------------------------------------------------------------
+
+// NdArray doesn't support quantization — these tests require GPU backends.
+// Uses Metal as the representative GPU backend for quantized matmul testing.
+
+#[cfg(feature = "metal")]
+mod quantized_test {
+    use super::*;
+    use burn::backend::{Autodiff, Metal};
+    use burn::tensor::f16;
+    use cubecl::wgpu::WgpuDevice;
+
+    type QuantBackend = Metal<f16, i64>;
+    type QuantAD = Autodiff<QuantBackend>;
+    type QuantDevice = WgpuDevice;
+
+    fn quant_device() -> QuantDevice {
+        Default::default()
+    }
+
+    fn make_quant_batch(
+        batch_size: usize,
+        seq_len: usize,
+        device: &QuantDevice,
+    ) -> lora_gemma2::SFTTrainingBatch<QuantAD> {
+        let input_data: Vec<i64> = (0..batch_size)
+            .flat_map(|_b| (1..=seq_len as i64).collect::<Vec<_>>())
+            .map(|t| t % 99 + 1)
+            .collect();
+        let target_data: Vec<i64> = (0..batch_size)
+            .flat_map(|_b| (2..=seq_len as i64 + 1).collect::<Vec<_>>())
+            .map(|t| t % 99 + 1)
+            .collect();
+
+        lora_gemma2::SFTTrainingBatch {
+            tokens_inputs: Tensor::<QuantAD, 2, Int>::from_data(
+                TensorData::new(input_data, [batch_size, seq_len]),
+                device,
+            ),
+            targets: Tensor::<QuantAD, 2, Int>::from_data(
+                TensorData::new(target_data, [batch_size, seq_len]),
+                device,
+            ),
+            mask_pad: Tensor::<QuantAD, 2, Bool>::zeros([batch_size, seq_len], device),
+        }
+    }
+
+    #[test]
+    fn test_quantized_weights_forward_backward() {
+        let device = quant_device();
+        let config = super::tiny_config();
+
+        // Build model on inner backend (no autodiff) so weights are leaf tensors
+        let inner_model = Gemma2Model::<QuantBackend>::new(&config, &device);
+
+        // Quantize weights to Q8S (per-tensor, production-ready from Phase 1 benchmarks)
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q8S)
+            .with_level(QuantLevel::Tensor);
+        let mut quantizer = Quantizer {
+            calibration: Calibration::MinMax,
+            scheme,
+        };
+        let quantized_inner = inner_model.quantize_weights(&mut quantizer);
+
+        // Convert to autodiff backend — frozen quantized weights stay compressed
+        let model = Gemma2Model::<QuantAD>::from_inner(quantized_inner);
+
+        // Apply LoRA on top of quantized base model
+        let lora_config = LoraConfig::new(4).with_alpha(8.0).with_bias(LoraBias::None);
+        let lora_model =
+            apply_lora_to_gemma2(model, &lora_config, LoraTarget::all_targets(), &device);
+        let sft_model = Gemma2ForSFT::new(lora_model, 0, false);
+
+        // Forward + backward pass — q_matmul should route through autodiff correctly
+        let batch = make_quant_batch(2, 8, &device);
+        let output = <Gemma2ForSFT<QuantAD> as TrainStep>::step(&sft_model, batch);
+        let loss_val: f32 = output.item.loss.into_scalar().elem();
+
+        assert!(
+            loss_val.is_finite(),
+            "Quantized forward+backward loss should be finite, got {loss_val}"
+        );
+        assert!(loss_val > 0.0, "Loss should be positive, got {loss_val}");
+    }
+
+    #[test]
+    fn test_quantized_training_reduces_loss() {
+        let device = quant_device();
+        let config = super::tiny_config();
+
+        // Quantize weights to Q8S before LoRA
+        let inner_model = Gemma2Model::<QuantBackend>::new(&config, &device);
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q8S)
+            .with_level(QuantLevel::Tensor);
+        let mut quantizer = Quantizer {
+            calibration: Calibration::MinMax,
+            scheme,
+        };
+        let quantized_inner = inner_model.quantize_weights(&mut quantizer);
+        let model = Gemma2Model::<QuantAD>::from_inner(quantized_inner);
+
+        let lora_config = LoraConfig::new(4).with_alpha(8.0).with_bias(LoraBias::None);
+        let lora_model =
+            apply_lora_to_gemma2(model, &lora_config, LoraTarget::all_targets(), &device);
+        let mut sft_model = Gemma2ForSFT::new(lora_model, 0, false);
+
+        let mut optimizer = AdamConfig::new().init();
+        let lr = 1e-3;
+        let mut losses = Vec::new();
+
+        for step in 0..8 {
+            let batch = make_quant_batch(2, 8, &device);
+            let output = <Gemma2ForSFT<QuantAD> as TrainStep>::step(&sft_model, batch);
+            let loss: f32 = output.item.loss.into_scalar().elem();
+            log::info!("[quantized] step {step}: loss={loss:.6}");
+            assert!(
+                loss.is_finite(),
+                "Loss should be finite at step {step}, got {loss}"
+            );
+            sft_model = sft_model.optimize(&mut optimizer, lr, output.grads);
+            losses.push(loss);
+        }
+
+        // Training should reduce loss over time (LoRA adapts on top of quantized base)
+        let first = losses[0];
+        let last = *losses.last().unwrap();
+        assert!(
+            last < first,
+            "Quantized training should reduce loss: first={first:.6}, last={last:.6}"
+        );
+    }
 }

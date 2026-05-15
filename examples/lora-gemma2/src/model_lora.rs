@@ -47,6 +47,13 @@ use burn::tensor::{
 use burn::train::{InferenceStep, SequenceOutput, TrainOutput, TrainStep};
 
 use crate::batcher::SFTTrainingBatch;
+#[cfg(any(
+    feature = "metal",
+    feature = "wgpu",
+    feature = "cuda",
+    feature = "vulkan",
+    feature = "rocm",
+))]
 use crate::fused_ops::FusedLoraMLPBackend;
 use crate::model::{Gemma2Attention, Gemma2Block, Gemma2MLP, Gemma2Model};
 use crate::types::LoraTarget;

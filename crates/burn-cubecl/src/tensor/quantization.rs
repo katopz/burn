@@ -119,4 +119,21 @@ impl<R: CubeRuntime> CubeTensor<R> {
             qparams.scales.dtype,
         ))
     }
+
+    /// Construct a separate tensor for the quantization biases, if present (affine mode only)
+    pub fn biases(&self) -> Option<CubeTensor<R>> {
+        let qparams = self.qparams.as_ref()?;
+        let bias_param = qparams.biases.as_ref()?;
+        let mut handle = self.handle.clone();
+        handle.offset_start = Some(bias_param.offset_start as u64);
+        handle.offset_end = Some(bias_param.offset_end as u64);
+
+        Some(CubeTensor::new(
+            self.client.clone(),
+            handle,
+            bias_param.metadata.clone(),
+            self.device.clone(),
+            bias_param.dtype,
+        ))
+    }
 }

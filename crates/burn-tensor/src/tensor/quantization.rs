@@ -45,6 +45,7 @@ pub fn compute_q_params<B: Backend>(
             let qparams = quantization::compute_q_params::<B>(scheme, min, max);
             QuantizationParameters {
                 scales: Tensor::from_primitive(TensorPrimitive::Float(qparams.scales)),
+                biases: qparams.biases.map(|b| Tensor::from_primitive(TensorPrimitive::Float(b))),
             }
         }
         _ => unreachable!(),

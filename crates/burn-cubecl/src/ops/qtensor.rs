@@ -144,7 +144,7 @@ fn new_quantized<R: CubeRuntime>(
         metadata: Metadata::new(scales_shape, scales_strides),
         dtype: scales_dtype,
     };
-    let qparams = QParams { scales };
+    let qparams = QParams { scales, biases: None };
 
     CubeTensor::new_quantized(
         client,

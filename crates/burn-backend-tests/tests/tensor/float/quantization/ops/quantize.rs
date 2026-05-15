@@ -33,6 +33,7 @@ fn should_support_quantize_symmetric_int8() {
     let scheme = TestBackend::default_quant_scheme(&device).with_value(QuantValue::Q8S);
     let qparams = QuantizationParameters {
         scales: TestTensor::from_data([0.014_173_228], &device),
+        biases: None,
     };
 
     let x_q = tensor.clone().quantize(&scheme, qparams);

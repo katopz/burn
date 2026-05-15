@@ -51,6 +51,8 @@ pub enum QuantPropagation {
 pub struct QParams<S> {
     /// The scaling factor.
     pub scales: S,
+    /// The bias (zero-point) for affine quantization. `None` for symmetric mode.
+    pub biases: Option<S>,
 }
 
 /// A quantization parameter tensor descriptor.
@@ -155,7 +157,7 @@ impl QuantizedBytes {
 
         let scales = bytemuck::cast_slice(&qparams_bytes[total_bytes - scales_size..]).to_vec();
 
-        (values, QParams { scales })
+        (values, QParams { scales, biases: None })
     }
 
     fn split_i8_values(self, num_params: usize) -> (Vec<i8>, Vec<u32>) {
@@ -387,6 +389,7 @@ mod tests {
         let (q_values, qparams) = q_bytes.into_vec_i8();
 
         assert_eq!(qparams.scales, vec![scale]);
+    assert!(qparams.biases.is_none());
 
         assert_eq!(q_values, values);
     }

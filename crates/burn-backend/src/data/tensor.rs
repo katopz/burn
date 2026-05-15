@@ -298,7 +298,7 @@ impl TensorData {
                 DType::QFloat(scheme) => match scheme {
                     QuantScheme {
                         level: QuantLevel::Tensor | QuantLevel::Block(_),
-                        mode: QuantMode::Symmetric,
+                        mode: QuantMode::Symmetric | QuantMode::Affine,
                         value:
                             QuantValue::Q8F
                             | QuantValue::Q8S
@@ -327,7 +327,7 @@ impl TensorData {
                     }
                     QuantScheme {
                         level: QuantLevel::Tensor | QuantLevel::Block(_),
-                        mode: QuantMode::Symmetric,
+                        mode: QuantMode::Symmetric | QuantMode::Affine,
                         value:
                             QuantValue::E4M3 | QuantValue::E5M2 | QuantValue::E2M1,
                         ..
@@ -712,7 +712,7 @@ impl core::fmt::Display for TensorData {
             DType::QFloat(scheme) => match scheme {
                 QuantScheme {
                     level: QuantLevel::Tensor | QuantLevel::Block(_),
-                    mode: QuantMode::Symmetric,
+                    mode: QuantMode::Symmetric | QuantMode::Affine,
                     value:
                         QuantValue::Q8F
                         | QuantValue::Q8S
@@ -727,7 +727,7 @@ impl core::fmt::Display for TensorData {
                 },
                 QuantScheme {
                         level: QuantLevel::Tensor | QuantLevel::Block(_),
-                        mode: QuantMode::Symmetric,
+                        mode: QuantMode::Symmetric | QuantMode::Affine,
                         value:
                             QuantValue::E4M3 | QuantValue::E5M2 | QuantValue::E2M1,
                         ..

@@ -4,6 +4,7 @@ use burn_std::{QuantLevel, QuantMode, QuantScheme, Shape};
 use super::{Calibration, QuantizationParametersPrimitive};
 use crate::{Backend, TensorMetadata, get_device_settings};
 
+
 /// Compute the quantization range mapping.
 pub fn compute_range<B: Backend>(
     scheme: &QuantScheme,
@@ -65,6 +66,29 @@ pub fn compute_q_params<B: Backend>(
 
             QuantizationParametersPrimitive {
                 scales: B::float_div_scalar(values_range, (b - a).into()),
+                biases: None,
+            }
+        }
+        QuantScheme {
+            level: QuantLevel::Tensor | QuantLevel::Block(_),
+            mode: QuantMode::Affine,
+            ..
+        } => {
+            // Quantized range `[a, b]`
+            let (a, b) = scheme.value.range();
+
+            // Affine: scale = (max - min) / (b - a)
+            // Maps the full [min, max] range to all quantization levels [a, b]
+            let scale = B::float_div_scalar(B::float_sub(max.clone(), min.clone()), (b - a).into());
+
+            // Bias maps quantization zero-point to data zero
+            // dequantize(q) = scale * q + bias
+            // We want q=a → min, so bias = min - scale * a
+            let bias = B::float_sub(min, B::float_mul_scalar(scale.clone(), a.into()));
+
+            QuantizationParametersPrimitive {
+                scales: scale,
+                biases: Some(bias),
             }
         }
     }

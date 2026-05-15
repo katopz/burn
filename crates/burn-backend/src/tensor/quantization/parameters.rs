@@ -12,4 +12,6 @@ pub use burn_std::quantization::{QParamTensor, QParams};
 pub struct QuantizationParametersPrimitive<B: Backend> {
     /// The scaling factor.
     pub scales: B::FloatTensorPrimitive,
+    /// The bias (zero-point) for affine quantization. `None` for symmetric mode.
+    pub biases: Option<B::FloatTensorPrimitive>,
 }

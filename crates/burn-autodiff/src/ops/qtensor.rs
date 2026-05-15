@@ -30,6 +30,7 @@ impl<B: Backend, C: CheckpointStrategy> QTensorOps<Self> for Autodiff<B, C> {
     ) -> QuantizedTensor<Self> {
         let inner_qparams = burn_backend::tensor::quantization::QuantizationParametersPrimitive {
             scales: qparams.scales.primitive,
+            biases: None,
         };
         B::quantize(tensor.primitive, scheme, inner_qparams)
     }

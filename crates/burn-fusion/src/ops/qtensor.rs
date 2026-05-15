@@ -57,7 +57,10 @@ impl<B: FusionBackend> QTensorOps<Self> for Fusion<B> {
                 let tensor = handles.get_float_tensor::<B>(&self.desc.tensor);
                 let scales = handles.get_float_tensor::<B>(&self.desc.qparams.scales);
 
-                let qparams = QuantizationParametersPrimitive { scales };
+                let qparams = QuantizationParametersPrimitive {
+                    scales,
+                    biases: None,
+                };
                 let output = B::quantize(tensor, &self.desc.scheme, qparams);
                 handles.register_quantized_tensor::<B>(&self.desc.out.id, output);
             }
@@ -68,6 +71,7 @@ impl<B: FusionBackend> QTensorOps<Self> for Fusion<B> {
         let client = tensor.client.clone();
         let qparams = QuantizationParametersIr {
             scales: qparams.scales.into_ir(),
+            biases: None,
         };
         let desc = QuantizeOpIr::create(tensor.into_ir(), qparams, *scheme, || {
             client.create_empty_handle()

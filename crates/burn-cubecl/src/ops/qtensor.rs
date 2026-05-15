@@ -169,7 +169,7 @@ where
             DType::QFloat(scheme) => match scheme {
                 QuantScheme {
                     level: QuantLevel::Tensor | QuantLevel::Block(_),
-                    mode: QuantMode::Symmetric,
+                    mode: QuantMode::Symmetric | QuantMode::Affine,
                     value:
                         QuantValue::Q8F
                         | QuantValue::Q8S

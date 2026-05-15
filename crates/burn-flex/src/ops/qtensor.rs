@@ -384,6 +384,7 @@ mod tests {
 
         let qparams = QuantizationParametersPrimitive {
             scales: scales_tensor,
+            biases: None,
         };
 
         // Quantize
@@ -424,6 +425,7 @@ mod tests {
 
         let qparams = QuantizationParametersPrimitive {
             scales: scales_tensor,
+            biases: None,
         };
 
         let qtensor = Flex::quantize(tensor, &scheme, qparams);
@@ -471,6 +473,7 @@ mod tests {
         let scales_tensor = FlexTensor::from_data(TensorData::new(vec![0.0f32], [1]));
         let qparams = QuantizationParametersPrimitive {
             scales: scales_tensor,
+            biases: None,
         };
 
         let qtensor = Flex::quantize(tensor, &scheme, qparams);
@@ -528,6 +531,7 @@ mod tests {
 
         let qparams = QuantizationParametersPrimitive {
             scales: scales_tensor,
+            biases: None,
         };
 
         let qtensor = Flex::quantize(tensor, &scheme, qparams);

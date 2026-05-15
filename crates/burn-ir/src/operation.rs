@@ -1325,6 +1325,8 @@ pub struct ConvTranspose3dOptionsIr {
 pub struct QuantizationParametersIr {
     /// The scaling factor.
     pub scales: TensorIr,
+    /// The bias (zero-point) for affine quantization. `None` for symmetric mode.
+    pub biases: Option<TensorIr>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Serialize, Deserialize)]

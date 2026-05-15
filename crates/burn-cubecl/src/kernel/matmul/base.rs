@@ -101,17 +101,23 @@ pub(crate) fn launch_matmul<R: CubeRuntime>(
             let scheme = *lhs.scheme();
             let data_dtype = data.dtype;
             let scale_dtype = scale.dtype;
-            let bias = lhs.biases().map(|b| b.binding());
+            // Always provide bias binding: use scale as dummy for symmetric mode
+            // to match the compiled kernel which always has a biases view slot
+            let scale_binding = scale.binding();
+            let bias = lhs
+                .biases()
+                .map(|b| b.binding())
+                .unwrap_or_else(|| scale_binding.clone());
             (
                 out_dtype,
                 InputBinding::quantized(
                     data.binding(),
-                    scale.binding(),
+                    scale_binding,
                     lhs.meta.shape().clone(),
                     scheme,
                     data_dtype.into(),
                     scale_dtype.into(),
-                    bias,
+                    Some(bias),
                 ),
             )
         }
@@ -139,17 +145,23 @@ pub(crate) fn launch_matmul<R: CubeRuntime>(
                 let scheme = *rhs.scheme();
                 let data_dtype = data.dtype;
                 let scale_dtype = scale.dtype;
-                let bias = rhs.biases().map(|b| b.binding());
+                // Always provide bias binding: use scale as dummy for symmetric mode
+                // to match the compiled kernel which always has a biases view slot
+                let scale_binding = scale.binding();
+                let bias = rhs
+                    .biases()
+                    .map(|b| b.binding())
+                    .unwrap_or_else(|| scale_binding.clone());
                 (
                     out_dtype,
                     InputBinding::quantized(
                         data.binding(),
-                        scale.binding(),
+                        scale_binding,
                         rhs.meta.shape().clone(),
                         scheme,
                         data_dtype.into(),
                         scale_dtype.into(),
-                        bias,
+                        Some(bias),
                     ),
                 )
             }

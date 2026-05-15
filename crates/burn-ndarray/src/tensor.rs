@@ -734,6 +734,11 @@ impl NdArrayQTensor {
                     .collect(),
                 block_size,
             ),
+            // Affine quantization not supported on ndarray — use GPU backends
+            _ => unimplemented!(
+                "NdArray does not support quantization scheme {:?}",
+                self.scheme
+            ),
         }
     }
 }

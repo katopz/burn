@@ -54,7 +54,10 @@ where
                         let qparams = qparams
                             .scales
                             .into_iter()
-                            .map(|scales| QParams { scales, biases: None })
+                            .map(|scales| QParams {
+                                scales,
+                                biases: None,
+                            })
                             .collect();
 
                         NdArrayQTensor {
@@ -74,6 +77,8 @@ where
                             | QuantValue::E5M2,
                         ..
                     } => unimplemented!("from_data not supported for scheme {scheme:?}"),
+                    // Affine quantization not supported on NdArray — use GPU backends
+                    _ => unimplemented!("NdArray does not support quantization scheme {scheme:?}"),
                 }
             }
             _ => panic!(
@@ -119,7 +124,10 @@ where
                 let values = strategy.quantize(data_f.as_slice().unwrap());
                 (
                     TensorData::quantized(values, shape.clone(), *scheme, &[scales]),
-                    vec![QParams { scales, biases: None }],
+                    vec![QParams {
+                        scales,
+                        biases: None,
+                    }],
                 )
             }
             QuantScheme {
@@ -144,7 +152,10 @@ where
                     .map(|&s| {
                         (
                             SymmetricQuantization::init(s, scheme.value),
-                            QParams { scales: s, biases: None },
+                            QParams {
+                                scales: s,
+                                biases: None,
+                            },
                         )
                     })
                     .unzip();

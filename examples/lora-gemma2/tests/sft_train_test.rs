@@ -728,4 +728,264 @@ mod quantized_test {
             / (losses.len() - losses.len() / 2).max(1) as f32;
         all_finite && second_half_avg <= first_half_avg
     }
+
+    /// Aligned tiny config: all dimensions are multiples of 8 for Q4 packing.
+    /// Original tiny_config has vocab=100 which panics with "last dim not multiple of 8".
+    fn tiny_config_aligned() -> Gemma2Config {
+        Gemma2Config::new(
+            104, // vocab_size — multiple of 8 for Q4S/Q4F packing
+            32,  // hidden_size
+            2,   // num_hidden_layers
+            64,  // intermediate_size
+            4,   // num_attention_heads
+            2,   // num_key_value_heads
+            8,   // head_dim
+        )
+    }
+
+    /// Q4S debug test with aligned dimensions — isolates the packed u32 matmul path.
+    ///
+    /// Uses `tiny_config_aligned()` (vocab=104) to avoid the fusion alignment bug
+    /// that occurs with vocab=100 (not multiple of 8 for Q4S packing).
+    ///
+    /// If this test produces NaN while Q8S passes, the bug is in the packed u32
+    /// dequantize path inside the cubek matmul kernel.
+    #[test]
+    fn test_q4s_aligned_training_finite() {
+        let device = quant_device();
+        let config = tiny_config_aligned();
+
+        let inner_model = Gemma2Model::<QuantBackend>::new(&config, &device);
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q4S)
+            .with_level(QuantLevel::Tensor);
+        let mut quantizer = Quantizer {
+            calibration: Calibration::MinMax,
+            scheme,
+        };
+        let quantized_inner = inner_model.quantize_weights(&mut quantizer);
+        let model = Gemma2Model::<QuantAD>::from_inner(quantized_inner);
+
+        let lora_config = LoraConfig::new(4).with_alpha(8.0).with_bias(LoraBias::None);
+        let lora_model =
+            apply_lora_to_gemma2(model, &lora_config, LoraTarget::all_targets(), &device);
+        let mut sft_model = Gemma2ForSFT::new(lora_model, 0, false);
+
+        let mut optimizer = AdamConfig::new().init();
+        let lr = 1e-3;
+        let mut losses = Vec::new();
+
+        for step in 0..8 {
+            let batch = make_quant_batch(2, 8, &device);
+            let output = <Gemma2ForSFT<QuantAD> as TrainStep>::step(&sft_model, batch);
+            let loss: f32 = output.item.loss.into_scalar().elem();
+            log::info!("[q4s-aligned] step {step}: loss={loss:.6}");
+            assert!(
+                loss.is_finite(),
+                "Q4S loss should be finite at step {step}, got {loss}"
+            );
+            assert!(
+                loss > 0.0,
+                "Q4S loss should be positive at step {step}, got {loss}"
+            );
+            sft_model = sft_model.optimize(&mut optimizer, lr, output.grads);
+            losses.push(loss);
+        }
+
+        log::info!("[q4s-aligned] losses: {losses:?}");
+        let first = losses[0];
+        let last = *losses.last().unwrap();
+        log::info!("[q4s-aligned] first={first:.6}, last={last:.6}");
+    }
+
+    /// Q4F affine debug test with aligned dimensions — tests the full affine path.
+    ///
+    /// Uses per-tensor affine quantization (tiny model dims < block_size=64, so tensor-level).
+    /// Affine provides better dynamic range than symmetric Q4S via scale + bias.
+    ///
+    /// If this produces NaN while Q8S passes, check:
+    /// 1. Bias binding mismatch in matmul launch (6 vs 5 bind groups)
+    /// 2. Scale/bias coordinate mapping in QuantizedView for packed u32
+    /// 3. Affine dequantize arithmetic: `scale * q + bias` overflow
+    #[test]
+    fn test_q4f_affine_aligned_training_finite() {
+        use burn::tensor::quantization::QuantMode;
+
+        let device = quant_device();
+        let config = tiny_config_aligned();
+
+        let inner_model = Gemma2Model::<QuantBackend>::new(&config, &device);
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q4F)
+            .with_mode(QuantMode::Affine)
+            .with_level(QuantLevel::Tensor);
+        let mut quantizer = Quantizer {
+            calibration: Calibration::MinMax,
+            scheme,
+        };
+        let quantized_inner = inner_model.quantize_weights(&mut quantizer);
+        let model = Gemma2Model::<QuantAD>::from_inner(quantized_inner);
+
+        let lora_config = LoraConfig::new(4).with_alpha(8.0).with_bias(LoraBias::None);
+        let lora_model =
+            apply_lora_to_gemma2(model, &lora_config, LoraTarget::all_targets(), &device);
+        let mut sft_model = Gemma2ForSFT::new(lora_model, 0, false);
+
+        let mut optimizer = AdamConfig::new().init();
+        let lr = 1e-3;
+        let mut losses = Vec::new();
+
+        for step in 0..8 {
+            let batch = make_quant_batch(2, 8, &device);
+            let output = <Gemma2ForSFT<QuantAD> as TrainStep>::step(&sft_model, batch);
+            let loss: f32 = output.item.loss.into_scalar().elem();
+            log::info!("[q4f-affine] step {step}: loss={loss:.6}");
+            assert!(
+                loss.is_finite(),
+                "Q4F affine loss should be finite at step {step}, got {loss}"
+            );
+            assert!(
+                loss > 0.0,
+                "Q4F affine loss should be positive at step {step}, got {loss}"
+            );
+            sft_model = sft_model.optimize(&mut optimizer, lr, output.grads);
+            losses.push(loss);
+        }
+
+        log::info!("[q4f-affine] losses: {losses:?}");
+        let first = losses[0];
+        let last = *losses.last().unwrap();
+        log::info!("[q4f-affine] first={first:.6}, last={last:.6}");
+    }
+
+    /// Medium config with dimensions proportional to real Gemma 2 2B.
+    /// All dims are multiples of 64 to support block quantization with block_size=64.
+    ///
+    /// Proportions: hidden=256, intermediate=512, vocab=256, heads=4, kv_heads=2, head_dim=64
+    /// vs Gemma 2 2B: hidden=2304, intermediate=9216, vocab=256000, heads=32, kv_heads=4, head_dim=256
+    fn medium_config() -> Gemma2Config {
+        Gemma2Config::new(
+            256, // vocab_size — multiple of 8 and 64
+            256, // hidden_size — multiple of 64
+            2,   // num_hidden_layers
+            512, // intermediate_size — multiple of 64
+            4,   // num_attention_heads
+            2,   // num_key_value_heads
+            64,  // head_dim — multiple of 64
+        )
+    }
+
+    /// Q4F affine with per-block quantization — reproduces the real training config.
+    ///
+    /// Uses `medium_config()` with block_size=64, matching the sft-train Q4F affine config.
+    /// This test exercises the full packed-u32 dequantize path through the cubek matmul kernel
+    /// with dimensions large enough to trigger autotune's accelerated/tiled kernel selection.
+    ///
+    /// Real Gemma 2 2B training with Q4F affine produced NaN in earlier testing.
+    /// If this test reproduces that, the root cause is in the packed matmul kernel path.
+    #[test]
+    fn test_q4f_affine_block64_medium_model() {
+        use burn::tensor::quantization::{BlockSize, QuantMode};
+
+        let device = quant_device();
+        let config = medium_config();
+
+        let inner_model = Gemma2Model::<QuantBackend>::new(&config, &device);
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q4F)
+            .with_mode(QuantMode::Affine)
+            .with_level(QuantLevel::Block(BlockSize::new([64])));
+        let mut quantizer = Quantizer {
+            calibration: Calibration::MinMax,
+            scheme,
+        };
+        let quantized_inner = inner_model.quantize_weights(&mut quantizer);
+        let model = Gemma2Model::<QuantAD>::from_inner(quantized_inner);
+
+        let lora_config = LoraConfig::new(4).with_alpha(8.0).with_bias(LoraBias::None);
+        let lora_model =
+            apply_lora_to_gemma2(model, &lora_config, LoraTarget::all_targets(), &device);
+        let mut sft_model = Gemma2ForSFT::new(lora_model, 0, false);
+
+        let mut optimizer = AdamConfig::new().init();
+        let lr = 1e-3;
+        let mut losses = Vec::new();
+
+        for step in 0..8 {
+            let batch = make_quant_batch(2, 8, &device);
+            let output = <Gemma2ForSFT<QuantAD> as TrainStep>::step(&sft_model, batch);
+            let loss: f32 = output.item.loss.into_scalar().elem();
+            log::info!("[q4f-blk64-medium] step {step}: loss={loss:.6}");
+            assert!(
+                loss.is_finite(),
+                "Q4F blk-64 loss should be finite at step {step}, got {loss}"
+            );
+            assert!(
+                loss > 0.0,
+                "Q4F blk-64 loss should be positive at step {step}, got {loss}"
+            );
+            sft_model = sft_model.optimize(&mut optimizer, lr, output.grads);
+            losses.push(loss);
+        }
+
+        log::info!("[q4f-blk64-medium] losses: {losses:?}");
+        let first = losses[0];
+        let last = *losses.last().unwrap();
+        log::info!("[q4f-blk64-medium] first={first:.6}, last={last:.6}");
+    }
+
+    /// Q4S with per-block quantization on medium model — symmetric baseline for comparison.
+    ///
+    /// If Q4F affine (above) produces NaN but Q4S (here) is fine, the bug is in the
+    /// affine-specific path (bias binding, affine dequantize arithmetic).
+    /// If both produce NaN, the bug is in the shared packed-u32 matmul path.
+    #[test]
+    fn test_q4s_block64_medium_model() {
+        use burn::tensor::quantization::BlockSize;
+
+        let device = quant_device();
+        let config = medium_config();
+
+        let inner_model = Gemma2Model::<QuantBackend>::new(&config, &device);
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q4S)
+            .with_level(QuantLevel::Block(BlockSize::new([64])));
+        let mut quantizer = Quantizer {
+            calibration: Calibration::MinMax,
+            scheme,
+        };
+        let quantized_inner = inner_model.quantize_weights(&mut quantizer);
+        let model = Gemma2Model::<QuantAD>::from_inner(quantized_inner);
+
+        let lora_config = LoraConfig::new(4).with_alpha(8.0).with_bias(LoraBias::None);
+        let lora_model =
+            apply_lora_to_gemma2(model, &lora_config, LoraTarget::all_targets(), &device);
+        let mut sft_model = Gemma2ForSFT::new(lora_model, 0, false);
+
+        let mut optimizer = AdamConfig::new().init();
+        let lr = 1e-3;
+        let mut losses = Vec::new();
+
+        for step in 0..8 {
+            let batch = make_quant_batch(2, 8, &device);
+            let output = <Gemma2ForSFT<QuantAD> as TrainStep>::step(&sft_model, batch);
+            let loss: f32 = output.item.loss.into_scalar().elem();
+            log::info!("[q4s-blk64-medium] step {step}: loss={loss:.6}");
+            assert!(
+                loss.is_finite(),
+                "Q4S blk-64 loss should be finite at step {step}, got {loss}"
+            );
+            assert!(
+                loss > 0.0,
+                "Q4S blk-64 loss should be positive at step {step}, got {loss}"
+            );
+            sft_model = sft_model.optimize(&mut optimizer, lr, output.grads);
+            losses.push(loss);
+        }
+
+        log::info!("[q4s-blk64-medium] losses: {losses:?}");
+        let first = losses[0];
+        let last = *losses.last().unwrap();
+        log::info!("[q4s-blk64-medium] first={first:.6}, last={last:.6}");
+    }
 }

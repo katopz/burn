@@ -4,7 +4,6 @@ use burn_std::{QuantLevel, QuantMode, QuantScheme, Shape};
 use super::{Calibration, QuantizationParametersPrimitive};
 use crate::{Backend, TensorMetadata, get_device_settings};
 
-
 /// Compute the quantization range mapping.
 pub fn compute_range<B: Backend>(
     scheme: &QuantScheme,
@@ -15,24 +14,44 @@ pub fn compute_range<B: Backend>(
         Calibration::MinMax => match scheme.level {
             QuantLevel::Tensor => (B::float_min(tensor.clone()), B::float_max(tensor)),
             QuantLevel::Block(block_size) => {
-                let block_elems = block_size.num_elements();
                 let shape = tensor.shape();
+                let rank = shape.num_dims();
+                let block_dims = block_size.to_dim_vec(rank);
                 let numel = shape.num_elements();
 
+                // Build interleaved reshape: [num_blocks_0, block_0, num_blocks_1, block_1, ...]
+                // Where block_i = min(shape_i, block_size_i) — handles dim < block_size (whole dim = 1 block)
+                let mut reshape = Vec::with_capacity(rank * 2);
+                for (&s, &b) in shape.iter().zip(block_dims.iter()) {
+                    let b = b as usize;
+                    let num_blocks = s.div_ceil(b);
+                    let actual_block = b.min(s);
+                    reshape.push(num_blocks);
+                    reshape.push(actual_block);
+                }
+
+                let reshape_numel: usize = reshape.iter().product();
                 assert_eq!(
-                    numel % block_elems,
-                    0,
-                    "Tensor {shape:?} must be evenly divisible by block size {block_elems}"
+                    reshape_numel, numel,
+                    "Block quantization reshape mismatch: {reshape:?} ({reshape_numel} elem) != \
+                     {shape:?} ({numel} elem). Each dim must be evenly divisible by block_size \
+                     or smaller than block_size."
                 );
 
-                let num_blocks = numel / block_elems;
+                let blocked = B::float_reshape(tensor, Shape::from(reshape));
 
-                let params_shape = params_shape(&shape, scheme.level);
+                // Take min/max over block dimensions (odd indices) from innermost to outermost.
+                // Processing in reverse order ensures indices don't shift after reduction.
+                let mut blocks_min = blocked.clone();
+                let mut blocks_max = blocked;
 
-                let blocks = B::float_reshape(tensor, Shape::new([num_blocks, block_elems]));
-                let blocks_min =
-                    B::float_reshape(B::float_min_dim(blocks.clone(), 1), params_shape.clone());
-                let blocks_max = B::float_reshape(B::float_max_dim(blocks, 1), params_shape);
+                for i in (0..rank).rev() {
+                    let dim = 2 * i + 1; // block dimension (odd index)
+                    blocks_min = B::float_min_dim(blocks_min, dim);
+                    blocks_max = B::float_max_dim(blocks_max, dim);
+                }
+
+                // Result shape = [num_blocks_0, num_blocks_1, ...] = params_shape
                 (blocks_min, blocks_max)
             }
         },

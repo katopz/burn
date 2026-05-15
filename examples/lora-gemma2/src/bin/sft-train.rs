@@ -65,7 +65,9 @@ use burn::optim::lr_scheduler::linear::LinearLrSchedulerConfig;
 use burn::record::CompactRecorder;
 use burn::tensor::Element;
 use burn::tensor::backend::AutodiffBackend;
-use burn::tensor::quantization::{Calibration, QuantLevel, QuantScheme, QuantValue};
+use burn::tensor::quantization::{
+    BlockSize, Calibration, QuantLevel, QuantMode, QuantScheme, QuantValue,
+};
 use burn::train::metric::LossMetric;
 use burn::train::{Learner, SupervisedTraining};
 
@@ -351,6 +353,8 @@ enum QuantizeScheme {
     Q4S,
     /// 8-bit symmetric quantization.
     Q8S,
+    /// 4-bit affine quantization with per-block scales+biases.
+    Q4fAffine,
 }
 
 impl QuantizeScheme {
@@ -359,6 +363,7 @@ impl QuantizeScheme {
             "none" => Some(Self::None),
             "q4s" => Some(Self::Q4S),
             "q8s" => Some(Self::Q8S),
+            "q4f_affine" => Some(Self::Q4fAffine),
             _ => None,
         }
     }
@@ -385,7 +390,9 @@ fn print_usage() {
     eprintln!("  --max-seq-length <N>     Max sequence length (default: 512)");
     eprintln!("  --val-split <F>          Validation split ratio (default: 0.1)");
     eprintln!("  --seed <N>               Random seed (default: 42)");
-    eprintln!("  --quantize <SCHEME>      Quantize frozen weights: none, q4s, q8s (default: none)");
+    eprintln!(
+        "  --quantize <SCHEME>      Quantize frozen weights: none, q4s, q8s, q4f_affine (default: none)"
+    );
     eprintln!("  --grad-accum <N>         Gradient accumulation steps (default: 4)");
     eprintln!("  --max-grad-norm <F>      Max gradient norm for clipping, 0=off (default: 1.0)");
     eprintln!("  --weight-decay <F>       Adam weight decay / L2 reg (default: 0.01)");
@@ -622,7 +629,7 @@ fn run<B: SftBackend>(args: SftArgs, device: B::Device) {
     // -----------------------------------------------------------------------
     let quant_scheme = QuantizeScheme::from_str(&args.quantize).unwrap_or_else(|| {
         eprintln!(
-            "Error: unknown quantize scheme '{}'. Use: none, q4s, q8s",
+            "Error: unknown quantize scheme '{}'. Use: none, q4s, q8s, q4f_affine",
             args.quantize
         );
         std::process::exit(1);
@@ -648,6 +655,20 @@ fn run<B: SftBackend>(args: SftArgs, device: B::Device) {
             let scheme = QuantScheme::default()
                 .with_value(QuantValue::Q8S)
                 .with_level(QuantLevel::Tensor);
+            let mut quantizer = Quantizer {
+                calibration: Calibration::MinMax,
+                scheme,
+            };
+            let quantized = inner_model.quantize_weights(&mut quantizer);
+            log::info!("  Quantization complete");
+            quantized
+        }
+        QuantizeScheme::Q4fAffine => {
+            log::info!("[5b/8] Quantizing frozen weights to Q4F affine (4-bit affine, blk-64)");
+            let scheme = QuantScheme::default()
+                .with_value(QuantValue::Q4F)
+                .with_mode(QuantMode::Affine)
+                .with_level(QuantLevel::Block(BlockSize::new([64])));
             let mut quantizer = Quantizer {
                 calibration: Calibration::MinMax,
                 scheme,

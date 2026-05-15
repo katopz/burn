@@ -101,6 +101,7 @@ pub(crate) fn launch_matmul<R: CubeRuntime>(
             let scheme = *lhs.scheme();
             let data_dtype = data.dtype;
             let scale_dtype = scale.dtype;
+            let bias = lhs.biases().map(|b| b.binding());
             (
                 out_dtype,
                 InputBinding::quantized(
@@ -110,6 +111,7 @@ pub(crate) fn launch_matmul<R: CubeRuntime>(
                     scheme,
                     data_dtype.into(),
                     scale_dtype.into(),
+                    bias,
                 ),
             )
         }
@@ -137,6 +139,7 @@ pub(crate) fn launch_matmul<R: CubeRuntime>(
                 let scheme = *rhs.scheme();
                 let data_dtype = data.dtype;
                 let scale_dtype = scale.dtype;
+                let bias = rhs.biases().map(|b| b.binding());
                 (
                     out_dtype,
                     InputBinding::quantized(
@@ -146,6 +149,7 @@ pub(crate) fn launch_matmul<R: CubeRuntime>(
                         scheme,
                         data_dtype.into(),
                         scale_dtype.into(),
+                        bias,
                     ),
                 )
             }

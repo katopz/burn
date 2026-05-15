@@ -79,7 +79,9 @@ fn new_quantized<R: CubeRuntime>(
     let data_size = match scheme.store {
         QuantStore::PackedU32(_) => {
             if !shape_last.is_multiple_of(num_quants) {
-                panic!("Can't store in u32")
+                panic!(
+                    "Can't pack {scheme:?} into u32: last dim {shape_last} not multiple of {num_quants} (shape={shape:?})"
+                )
             }
             shape_value[rank - 1] = shape_last.div_ceil(num_quants);
             size_of::<u32>()

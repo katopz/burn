@@ -190,9 +190,16 @@ impl<B: Backend> Gemma4AttentionLora<B> {
             None => scores,
         };
 
-        // Softmax in f32, then cast back for value weighted sum
-        let weights = softmax(scores, 3).cast(original_dtype);
-        let output = weights.matmul(values);
+        // Softmax in f32. For full attention, keep f32 through value weighted sum to
+        // avoid mixed-dtype binary ops (f16 × f32) crashing burn-fusion BinaryOpIr
+        // during backward. For sliding attention, values are already original_dtype,
+        // so casting weights back is safe (f16 × f16).
+        let weights = softmax(scores, 3);
+        let output = if self.layer_type == LayerType::Full {
+            weights.matmul(values) // f32 × f32
+        } else {
+            weights.cast(original_dtype).matmul(values) // f16 × f16
+        };
 
         // --- Reshape + output projection (LoRA) ---
         let output = output

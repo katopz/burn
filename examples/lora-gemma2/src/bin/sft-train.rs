@@ -50,6 +50,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use burn::data::dataloader::DataLoaderBuilder;
@@ -748,27 +749,39 @@ fn run<B: SftBackend>(args: SftArgs, device: B::Device) {
     let training = training.summary();
 
     // -----------------------------------------------------------------------
-    // 8b. Resource Limits (Duration + RAM)
+    // 8b. Resource Limits (Duration + RAM) + Peak Memory Tracking
     // -----------------------------------------------------------------------
     let max_duration = args.max_duration;
     let max_ram = args.max_ram;
+    let peak_rss_kb: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
-    if max_duration.is_some() || max_ram.is_some() {
+    {
         let interrupter = training.interrupter();
-        log::info!("  Resource limits:");
-        if let Some(secs) = max_duration {
-            log::info!("    Duration: {secs}s ({:.1}min)", secs as f64 / 60.0);
-        }
-        if let Some(gb) = max_ram {
-            log::info!("    RAM: {gb:.1} GB");
+        let peak_rss_kb = peak_rss_kb.clone();
+
+        if max_duration.is_some() || max_ram.is_some() {
+            log::info!("  Resource limits:");
+            if let Some(secs) = max_duration {
+                log::info!("    Duration: {secs}s ({:.1}min)", secs as f64 / 60.0);
+            }
+            if let Some(gb) = max_ram {
+                log::info!("    RAM: {gb:.1} GB");
+            }
         }
 
-        // Spawn monitoring thread — checks duration/RAM every 5s, stops training via Interrupter
+        // Spawn monitoring thread — tracks peak RSS + checks limits every 5s
+        // Thread exits when a limit is hit; otherwise runs until process exits.
         std::thread::spawn(move || {
             let start = Instant::now();
             let interval = std::time::Duration::from_secs(5);
             loop {
                 std::thread::sleep(interval);
+
+                // Track peak RSS (always, regardless of limits)
+                if let Some(rss_gb) = get_process_rss_gb() {
+                    let rss_kb = (rss_gb * 1024.0 * 1024.0) as u64;
+                    peak_rss_kb.fetch_max(rss_kb, Ordering::Relaxed);
+                }
 
                 if let Some(max_secs) = max_duration {
                     let elapsed = start.elapsed().as_secs();
@@ -799,7 +812,11 @@ fn run<B: SftBackend>(args: SftArgs, device: B::Device) {
     // -----------------------------------------------------------------------
     // 9. Run Training
     // -----------------------------------------------------------------------
-    log::info!("[8/8] Starting training...\n");
+    log::info!("[8/8] Starting training...");
+    if let Some(rss_gb) = get_process_rss_gb() {
+        log::info!("  RSS after model load: {rss_gb:.1} GB");
+    }
+    log::info!("\n");
 
     // LR schedule: optional linear warmup + cosine annealing decay
     let warmup_steps = args.warmup_steps;
@@ -879,6 +896,18 @@ fn run<B: SftBackend>(args: SftArgs, device: B::Device) {
     log::info!("  Trainable params: {lora_params} ({pct:.2}%)");
     log::info!("  Total params: {total_params}");
     log::info!("  Epochs: {}", args.epochs);
+
+    // Peak RSS from monitoring thread
+    let peak_kb = peak_rss_kb.load(Ordering::Relaxed);
+    if peak_kb > 0 {
+        let peak_gb = peak_kb as f64 / 1024.0 / 1024.0;
+        log::info!("  Peak RSS: {peak_gb:.1} GB");
+    } else {
+        // Monitoring thread may not have sampled yet (short run)
+        if let Some(rss_gb) = get_process_rss_gb() {
+            log::info!("  RSS: {rss_gb:.1} GB");
+        }
+    }
 
     log::info!("\nDone!");
 }

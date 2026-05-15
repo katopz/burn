@@ -165,6 +165,8 @@ pub enum FuseOp {
     Dequantize {
         values: FuseArg,
         params: FuseArg,
+        /// Biases for affine quantization mode. `None` for symmetric mode.
+        biases: Option<FuseArg>,
         output: FuseArg,
         scheme: QuantSchemeFuse,
     },
@@ -234,12 +236,13 @@ impl Display for FuseOp {
             FuseOp::Dequantize {
                 values,
                 params,
+                biases,
                 output,
                 scheme: _,
             } => write!(
                 f,
-                "{} = dequantize(values={}, params={})",
-                output, values, params
+                "{} = dequantize(values={}, params={}, biases={:?})",
+                output, values, params, biases
             ),
         }
     }
@@ -699,11 +702,15 @@ impl FuseOp {
             FuseOp::Dequantize {
                 values,
                 params,
+                biases,
                 output,
                 scheme: _,
             } => {
                 values.multi_block_variable(registers);
                 params.multi_block_variable(registers);
+                if let Some(biases) = biases {
+                    biases.multi_block_variable(registers);
+                }
                 output.multi_block_variable(registers);
             }
         }

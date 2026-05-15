@@ -1,5 +1,5 @@
 use super::{BlockPlan, HandleInput, InputReference};
-use super::{LaunchPlan, NormalHandleInput, PotentialInplace};
+use super::{LaunchPlan, NormalHandleInput, PotentialInplace, QuantBiasesHandleInput};
 use crate::CubeFusionHandle;
 use crate::engine::launch::{QuantParamsHandleInput, QuantValuesHandleInput};
 use crate::engine::trace::block::FuseBlock;
@@ -8,6 +8,7 @@ use burn_fusion::stream::Context;
 use burn_ir::{TensorIr, TensorStatus};
 use burn_std::quantization::params_shape;
 use cubecl::Runtime;
+use cubek::quantization::scheme::QuantMode;
 use std::marker::PhantomData;
 
 /// Fetch and register [input handles](HandleInput). Also identifies potential inputs that
@@ -78,6 +79,14 @@ impl<'a, R: Runtime> InputPlanner<'a, R> {
 
                     let global_shape = tensor_global.shape.clone();
                     let shape_params = params_shape(&global_shape, scheme.level);
+
+                    // Extract biases before moving handle (affine mode)
+                    let biases_handle = if scheme.mode == QuantMode::Affine {
+                        handle.biases(scheme)
+                    } else {
+                        None
+                    };
+
                     plan.handle_inputs
                         .push(HandleInput::QuantValues(QuantValuesHandleInput {
                             relative_id: tensor_relative.id,
@@ -91,13 +100,27 @@ impl<'a, R: Runtime> InputPlanner<'a, R> {
                         .push(HandleInput::QuantParams(QuantParamsHandleInput {
                             precision: precision_scales,
                             handle: params,
-                            shape: shape_params,
+                            shape: shape_params.clone(),
                         }));
+
+                    // Affine mode: register biases tensor
+                    if let Some(biases) = biases_handle {
+                        plan.handle_inputs
+                            .push(HandleInput::QuantBiases(QuantBiasesHandleInput {
+                                precision: precision_scales,
+                                handle: biases,
+                                shape: shape_params,
+                            }));
+                    }
                 }
                 RegisterTensor::QuantParams(_) => {
                     // It is registered at the same time as quant data.
                     // The order is important and the index in the vector as well, so that's why we
                     // have QuantParams.
+                }
+                RegisterTensor::QuantBiases(_) => {
+                    // It is registered at the same time as quant data (affine mode).
+                    // The order is important and the index in the vector as well.
                 }
             }
         }

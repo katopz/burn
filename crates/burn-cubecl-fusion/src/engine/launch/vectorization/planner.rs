@@ -93,7 +93,7 @@ impl<'a, R: Runtime> VectorizationPlanner<'a, R> {
                     }
                     _ => panic!("Unable to retrieve the scheme for quantized values."),
                 },
-                HandleInput::QuantParams(..) => continue,
+                HandleInput::QuantParams(..) | HandleInput::QuantBiases(..) => continue,
             };
             let elem_size = elem.size();
 
@@ -147,6 +147,7 @@ impl<'a, R: Runtime> VectorizationPlanner<'a, R> {
                                 VectorizationHandle::QuantValues(&h.handle, &h.global_ir)
                             }
                             HandleInput::QuantParams(_) => VectorizationHandle::QuantParams,
+                            HandleInput::QuantBiases(_) => VectorizationHandle::QuantBiases,
                         })
                     } else {
                         None
@@ -174,7 +175,7 @@ impl<'a, R: Runtime> VectorizationPlanner<'a, R> {
             let (global_ir, relative_id) = match handle {
                 HandleInput::Normal(h) => (&h.global_ir, &h.relative_id),
                 HandleInput::QuantValues(h) => (&h.global_ir, &h.relative_id),
-                HandleInput::QuantParams(_) => continue,
+                HandleInput::QuantParams(_) | HandleInput::QuantBiases(_) => continue,
             };
             let (vect, br) = match plan.vectorizations.get(&global_ir.id) {
                 Some(v) => (v.vector_size(), v.is_broadcast()),
@@ -239,7 +240,7 @@ impl<'a, R: Runtime> VectorizationPlanner<'a, R> {
                         HandleInput::QuantValues(handle) => {
                             handle.vector_size = *vect;
                         }
-                        HandleInput::QuantParams(_) => {}
+                        HandleInput::QuantParams(_) | HandleInput::QuantBiases(_) => {}
                     }
                 }
                 Vect::Broadcasted => {}
@@ -347,7 +348,7 @@ fn apply_vectorization_block<R: Runtime>(
                     HandleInput::QuantValues(input) => {
                         input.vector_size = vect;
                     }
-                    HandleInput::QuantParams(_) => {
+                    HandleInput::QuantParams(_) | HandleInput::QuantBiases(_) => {
                         // Not vectorized
                     }
                 }

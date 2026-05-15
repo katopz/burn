@@ -59,6 +59,7 @@ impl<'a, R: Runtime> OutputPlanner<'a, R> {
                 RegisterTensor::Normal(ir, p) => Some((pos, ir, p)),
                 RegisterTensor::QuantValues(_) => None,
                 RegisterTensor::QuantParams(_) => None,
+                RegisterTensor::QuantBiases(_) => None,
             })
             .map(|(pos, tensor, precision)| OutputSorted {
                 pos_original: pos,

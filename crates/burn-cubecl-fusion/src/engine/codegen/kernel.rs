@@ -6,7 +6,10 @@ use cubecl::{
     ir::{ElemType, FloatKind, StorageType, UIntKind},
     prelude::*,
 };
-use cubek::quantization::{dequantize::dequantize_symmetric_packed_value_at, scheme::QuantMode};
+use cubek::quantization::{
+    dequantize::{dequantize_affine_packed_value_at, dequantize_symmetric_packed_value_at},
+    scheme::QuantMode,
+};
 
 #[cube]
 /// Fuse element-wise operations at the given write position.
@@ -61,7 +64,7 @@ pub fn fuse_on_write<E: Scalar, N: Size>(
 ///
 /// # Returns
 ///
-/// - A sequence of values associated to the given `read_args`.  
+/// - A sequence of values associated to the given `read_args`.
 pub fn fuse_on_read<E: Scalar, N: Size>(
     inputs: &GlobalArgs,
     outputs: &mut GlobalArgs,
@@ -297,6 +300,7 @@ fn fuse(
             FuseOp::Dequantize {
                 values,
                 params,
+                biases,
                 output,
                 scheme,
             } => dequantize::<E, N>(
@@ -306,6 +310,7 @@ fn fuse(
                 pos,
                 values,
                 params,
+                biases,
                 output,
                 scheme.scheme,
                 config,
@@ -750,16 +755,11 @@ fn dequantize<C: Float, N: Size>(
     write_pos: usize,
     #[comptime] input: FuseArg,
     #[comptime] scales: FuseArg,
+    #[comptime] biases: Option<FuseArg>,
     #[comptime] output: FuseArg,
     #[comptime] scheme: QuantScheme,
     #[comptime] config: &FuseBlockConfig,
 ) {
-    comptime!(assert_eq!(
-        scheme.mode,
-        QuantMode::Symmetric,
-        "Only symmetric quantization mode is supported."
-    ));
-
     let quant_ty = comptime![match scheme.store {
         QuantStore::Native => match scheme.value {
             QuantValue::Q8F | QuantValue::Q8S => StorageType::Scalar(ElemType::UInt(UIntKind::U8)),
@@ -800,7 +800,7 @@ fn dequantize<C: Float, N: Size>(
         FuseArg::Input(pos, _, _) => pos,
         _ => panic!("Not supported"),
     });
-    let pos = comptime!(match scales {
+    let scales_pos = comptime!(match scales {
         FuseArg::Input(pos, ..) => pos,
         _ => unreachable!(""),
     });
@@ -811,16 +811,43 @@ fn dequantize<C: Float, N: Size>(
     let input =
         read_quantized::<QStoreType, QStoreSize>(inputs, locals, write_pos, input, config, scheme);
 
-    let scales =
-        input_as_scales_view::<QParamType, Const<1>>(inputs, pos, tensor_pos, scheme.level, config);
+    let scales = input_as_scales_view::<QParamType, Const<1>>(
+        inputs,
+        scales_pos,
+        tensor_pos,
+        scheme.level,
+        config,
+    );
 
-    let result = dequantize_symmetric_packed_value_at::<
-        C,
-        NumQuant,
-        QParamType,
-        QStoreType,
-        QStoreSize,
-    >(write_pos * num_quants, input, &scales, scheme);
+    let result = match scheme.mode {
+        QuantMode::Symmetric => dequantize_symmetric_packed_value_at::<
+            C,
+            NumQuant,
+            QParamType,
+            QStoreType,
+            QStoreSize,
+        >(write_pos * num_quants, input, &scales, scheme),
+        QuantMode::Affine => {
+            let biases_pos = comptime!(match biases {
+                Some(FuseArg::Input(pos, ..)) => pos,
+                _ => panic!("Affine mode requires biases argument"),
+            });
+            let biases_view = input_as_scales_view::<QParamType, Const<1>>(
+                inputs,
+                biases_pos,
+                tensor_pos,
+                scheme.level,
+                config,
+            );
+            dequantize_affine_packed_value_at::<C, NumQuant, QParamType, QStoreType, QStoreSize>(
+                write_pos * num_quants,
+                input,
+                &scales,
+                &biases_view,
+                scheme,
+            )
+        }
+    };
 
     let mut vector = Vector::empty();
 

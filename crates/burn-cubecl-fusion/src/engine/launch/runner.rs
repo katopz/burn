@@ -35,6 +35,7 @@ pub enum VectorizationHandle<'a, R: Runtime> {
     NormalInput(&'a CubeFusionHandle<R>, &'a TensorIr),
     QuantValues(&'a CubeFusionHandle<R>, &'a TensorIr),
     QuantParams,
+    QuantBiases,
 }
 
 impl<'a, R: Runtime> VectorizationHandle<'a, R> {
@@ -44,6 +45,7 @@ impl<'a, R: Runtime> VectorizationHandle<'a, R> {
             VectorizationHandle::NormalInput(_, tensor_ir) => tensor_ir.id == id,
             VectorizationHandle::QuantValues(_, tensor_ir) => tensor_ir.id == id,
             VectorizationHandle::QuantParams => false,
+            VectorizationHandle::QuantBiases => false,
         }
     }
 }

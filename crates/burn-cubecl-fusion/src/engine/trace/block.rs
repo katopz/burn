@@ -5,6 +5,7 @@ use crate::engine::{
 };
 use burn_ir::{TensorId, TensorIr, TensorStatus};
 use burn_std::{DType, Shape, quantization::QuantParam};
+use cubek::quantization::scheme::QuantMode;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, btree_map::Entry};
 
@@ -55,7 +56,12 @@ pub enum QuantInput {
     /// corresponding to the float value.
     AlreadyDequantized { local: FuseArg },
     /// Otherwise we return the information necessary to dequantize the tensor.
-    Quantized { values: FuseArg, params: FuseArg },
+    Quantized {
+        values: FuseArg,
+        params: FuseArg,
+        /// Biases for affine quantization mode. `None` for symmetric mode.
+        biases: Option<FuseArg>,
+    },
 }
 
 impl FuseBlockBuilder {
@@ -217,15 +223,18 @@ impl FuseBlockBuilder {
         }
 
         let precision = tensor.dtype.into();
-        let precision_scales = match tensor.dtype {
-            DType::QFloat(scheme) => match scheme.param {
-                QuantParam::F32 => FuseType::F32,
-                QuantParam::F16 => FuseType::F16,
-                QuantParam::BF16 => FuseType::BF16,
-                QuantParam::UE8M0 | QuantParam::UE4M3 => {
-                    unimplemented!("Unsupported fuse precision");
-                }
-            },
+        let (precision_scales, is_affine) = match tensor.dtype {
+            DType::QFloat(scheme) => {
+                let prec = match scheme.param {
+                    QuantParam::F32 => FuseType::F32,
+                    QuantParam::F16 => FuseType::F16,
+                    QuantParam::BF16 => FuseType::BF16,
+                    QuantParam::UE8M0 | QuantParam::UE4M3 => {
+                        unimplemented!("Unsupported fuse precision");
+                    }
+                };
+                (prec, scheme.mode == QuantMode::Affine)
+            }
             _ => return None,
         };
 
@@ -235,9 +244,12 @@ impl FuseBlockBuilder {
                 QuantInput::AlreadyDequantized { local }
             }
             None => {
-                let (new_input, q_index) = resources.inputs.insert_quant(tensor.clone());
+                let (new_input, q_index, b_index) =
+                    resources.inputs.insert_quant(tensor.clone(), is_affine);
                 let input = FuseArg::Input(new_input, precision, LayoutInfo::Unknown);
                 let scales = FuseArg::Input(q_index, precision_scales, LayoutInfo::Unknown);
+                let biases =
+                    b_index.map(|pos| FuseArg::Input(pos, precision_scales, LayoutInfo::Unknown));
 
                 // Important to flag that there is a read, even if no operation is registered.
                 if let Entry::Vacant(e) = self.reads.entry(tensor.id) {
@@ -247,6 +259,7 @@ impl FuseBlockBuilder {
                 QuantInput::Quantized {
                     values: input,
                     params: scales,
+                    biases,
                 }
             }
         };

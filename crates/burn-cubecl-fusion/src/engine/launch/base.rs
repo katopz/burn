@@ -88,6 +88,9 @@ impl<'a, R: Runtime, Runner: TraceRunner<R>> FuseTraceLauncher<'a, R, Runner> {
                 HandleInput::QuantParams(_) => {
                     // The scales are part of the quant data handle.
                 }
+                HandleInput::QuantBiases(_) => {
+                    // The biases are part of the quant data handle.
+                }
             };
         }
         for output in handle_outputs {

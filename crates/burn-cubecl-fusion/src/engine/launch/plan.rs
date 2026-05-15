@@ -201,12 +201,21 @@ pub struct QuantParamsHandleInput<R: Runtime> {
     pub shape: Shape,
 }
 
+/// An input handle containing biases for affine quantization.
+#[derive(Debug, Clone)]
+pub struct QuantBiasesHandleInput<R: Runtime> {
+    pub precision: FuseType,
+    pub handle: CubeFusionHandle<R>,
+    pub shape: Shape,
+}
+
 /// Different types of inputs that can be passed to a fused kernel.
 #[derive(Debug, Clone)]
 pub enum HandleInput<R: Runtime> {
     Normal(NormalHandleInput<R>),
     QuantValues(QuantValuesHandleInput<R>),
     QuantParams(QuantParamsHandleInput<R>),
+    QuantBiases(QuantBiasesHandleInput<R>),
 }
 
 impl<R: Runtime> HandleInput<R> {

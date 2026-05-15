@@ -195,6 +195,16 @@ fn register_inputs<R: Runtime>(
                     at,
                 ));
             }
+            HandleInput::QuantBiases(hi) => {
+                let at = hi.handle.required_address_type();
+                let arg = hi.handle.into_tensor_arg(hi.shape.clone());
+                inputs.tensors.push(GlobalTensorArg::new(
+                    arg,
+                    hi.precision.into_type(1),
+                    false,
+                    at,
+                ));
+            }
         }
     }
 }

@@ -218,7 +218,11 @@ impl TraceOperationFuser {
     ///
     /// - The argument that maps to the tensor values to be used during kernel expansion.
     /// - The argument that maps to the tensor params to be used during kernel expansion.
-    pub fn input_quantized_unhandled(&mut self, tensor: &TensorIr) -> Option<(FuseArg, FuseArg)> {
+    /// - The argument that maps to the tensor biases (affine mode), if present.
+    pub fn input_quantized_unhandled(
+        &mut self,
+        tensor: &TensorIr,
+    ) -> Option<(FuseArg, FuseArg, Option<FuseArg>)> {
         self.fuser.fuser.input_quantized_unhandled(tensor)
     }
 
@@ -507,10 +511,15 @@ impl TraceOperationFuser {
                                 out,
                             }));
                         }
-                        QuantInput::Quantized { values, params } => {
+                        QuantInput::Quantized {
+                            values,
+                            params,
+                            biases,
+                        } => {
                             build.fuse_operation(FuseOp::Dequantize {
                                 values,
                                 params,
+                                biases,
                                 output: out,
                                 scheme: match desc.input.dtype {
                                     DType::QFloat(scheme) => QuantSchemeFuse { scheme },

@@ -109,6 +109,29 @@ impl<R: Runtime> CubeFusionHandle<R> {
             qparams: None,
         })
     }
+
+    /// Construct a separate tensor for the quantization biases (affine mode), if present
+    pub fn biases(&self, scheme: QuantScheme) -> Option<Self> {
+        let qparams = self.qparams.as_ref()?;
+        let biases = qparams.biases.as_ref()?;
+        let mut handle = self.handle.clone();
+        handle.offset_start = Some(biases.offset_start as u64);
+        handle.offset_end = Some(biases.offset_end as u64);
+
+        Some(Self {
+            client: self.client.clone(),
+            handle,
+            device: self.device.clone(),
+            dtype: match scheme.param {
+                QuantParam::F32 => DType::F32,
+                QuantParam::F16 => DType::F16,
+                QuantParam::BF16 => DType::BF16,
+                QuantParam::UE8M0 | QuantParam::UE4M3 => unimplemented!("Not yet supported"),
+            },
+            strides: biases.metadata.strides().clone(),
+            qparams: None,
+        })
+    }
 }
 
 pub(crate) fn strides_dyn_rank(shape: &[usize]) -> Strides {

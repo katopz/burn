@@ -327,6 +327,7 @@ impl<'a, R: Runtime> Vectorization<R> for FusedMatmulLaunch<'a> {
                     }
                 }
                 HandleInput::QuantParams(_) => {}
+                HandleInput::QuantBiases(_) => {}
             }
         }
 

@@ -236,6 +236,7 @@ pub enum RegisterTensor {
     Normal(TensorIr, FuseType),
     QuantValues(TensorIr),
     QuantParams(TensorId),
+    QuantBiases(TensorId),
 }
 
 impl RegisterTensor {
@@ -244,6 +245,7 @@ impl RegisterTensor {
             RegisterTensor::Normal(tensor_ir, precision) => Some((tensor_ir, precision)),
             RegisterTensor::QuantValues(_) => None,
             RegisterTensor::QuantParams(_) => None,
+            RegisterTensor::QuantBiases(_) => None,
         }
     }
 }
@@ -270,6 +272,7 @@ impl RegisteredTensors {
             RegisterTensor::Normal(tensor_ir, _) => tensor_ir.id,
             RegisterTensor::QuantValues(tensor_ir) => tensor_ir.id,
             RegisterTensor::QuantParams(tensor_id) => *tensor_id,
+            RegisterTensor::QuantBiases(tensor_id) => *tensor_id,
         })
     }
 
@@ -282,6 +285,7 @@ impl RegisteredTensors {
                 RegisterTensor::Normal(tensor_ir, _) => tensor_ir.id == tensor_id,
                 RegisterTensor::QuantValues(_) => false,
                 RegisterTensor::QuantParams(_) => false,
+                RegisterTensor::QuantBiases(_) => false,
             })
             .map(|(pos, _)| pos)
     }
@@ -295,6 +299,7 @@ impl RegisteredTensors {
                 RegisterTensor::Normal(..) => false,
                 RegisterTensor::QuantValues(tensor_ir) => tensor_ir.id == tensor_id,
                 RegisterTensor::QuantParams(_) => false,
+                RegisterTensor::QuantBiases(_) => false,
             })
             .map(|(pos, _)| pos)
     }
@@ -307,6 +312,7 @@ impl RegisteredTensors {
                 RegisterTensor::Normal(tensor_ir, _) => tensor_ir.id == tensor_id,
                 RegisterTensor::QuantValues(_) => false,
                 RegisterTensor::QuantParams(_) => false,
+                RegisterTensor::QuantBiases(_) => false,
             })
             .and_then(|entry| match entry {
                 RegisterTensor::Normal(tensor_ir, fuse_precision) => {
@@ -314,23 +320,38 @@ impl RegisteredTensors {
                 }
                 RegisterTensor::QuantValues(_) => None,
                 RegisterTensor::QuantParams(_) => None,
+                RegisterTensor::QuantBiases(_) => None,
             })
     }
 
     /// Insert a quantized tensor.
     ///
-    /// It will return the positions for both the value tensor and param tensor.
-    pub fn insert_quant(&mut self, tensor: TensorIr) -> (usize, usize) {
+    /// It will return the positions for the value tensor, param tensor, and optionally the biases tensor.
+    pub fn insert_quant(
+        &mut self,
+        tensor: TensorIr,
+        is_affine: bool,
+    ) -> (usize, usize, Option<usize>) {
         if let Some(old) = self.tensors.iter().enumerate().find(|(_, val)| match &val {
             RegisterTensor::QuantValues(tensor_ir) => tensor_ir == &tensor,
             _ => false,
         }) {
             let values = old.0;
             let params = values + 1;
-            return (values, params);
+            // Check if biases already registered for affine
+            let biases = if is_affine {
+                self.tensors.get(params + 1).and_then(|e| match e {
+                    RegisterTensor::QuantBiases(_) => Some(params + 1),
+                    _ => None,
+                })
+            } else {
+                None
+            };
+            return (values, params, biases);
         }
 
-        let params = RegisterTensor::QuantParams(tensor.id);
+        let tensor_id = tensor.id;
+        let params = RegisterTensor::QuantParams(tensor_id);
         let values = RegisterTensor::QuantValues(tensor);
         let pos_values = self.len();
         self.tensors.push(values);
@@ -338,7 +359,16 @@ impl RegisteredTensors {
         let pos_params = self.len();
         self.tensors.push(params);
 
-        (pos_values, pos_params)
+        let biases = if is_affine {
+            let biases = RegisterTensor::QuantBiases(tensor_id);
+            let pos_biases = self.len();
+            self.tensors.push(biases);
+            Some(pos_biases)
+        } else {
+            None
+        };
+
+        (pos_values, pos_params, biases)
     }
 
     /// Insert a normal tensor with the given [precision](FusePrecision) in the current block.
@@ -366,7 +396,9 @@ impl RegisteredTensors {
     pub fn update(&mut self, tensor: &TensorIr) {
         if let Some(entry) = self.tensors.iter_mut().find(|entry| match entry {
             RegisterTensor::Normal(tensor_ir, _) => tensor_ir.id == tensor.id,
-            _ => false,
+            RegisterTensor::QuantValues(_) => false,
+            RegisterTensor::QuantParams(_) => false,
+            RegisterTensor::QuantBiases(_) => false,
         }) && let RegisterTensor::Normal(tensor_ir, _) = entry
         {
             tensor_ir.status = tensor.status

@@ -114,6 +114,7 @@ pub(crate) fn vectorization_default<'a, R: Runtime>(
                 VectorizationHandle::NormalInput(handle, tensor_ir) => (handle, &tensor_ir.id),
                 VectorizationHandle::QuantValues(..) => panic!("Can't be swapped"),
                 VectorizationHandle::QuantParams => panic!("Can't be swapped"),
+                VectorizationHandle::QuantBiases => panic!("Can't be swapped"),
             };
             let val = vectorization_swapped(
                 handle,
@@ -158,6 +159,9 @@ pub(crate) fn vectorization_default<'a, R: Runtime>(
                     vectorizations.insert(tensor_ir.id, val);
                 }
                 VectorizationHandle::QuantParams => {
+                    // Doesn't have vectorization for now.
+                }
+                VectorizationHandle::QuantBiases => {
                     // Doesn't have vectorization for now.
                 }
             };

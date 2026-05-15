@@ -12,6 +12,7 @@ use burn_fusion::stream::ScalarId;
 use burn_ir::{ScalarIr, TensorIr};
 use burn_std::{DType, Shape};
 use cubecl::quant::scheme::QuantParam;
+use cubek::quantization::scheme::QuantMode;
 
 #[derive(Clone, Debug)]
 /// It is responsible to create a [trace](FuseTrace) composed of multiple [blocks](super::block::FuseBlock).
@@ -169,31 +170,41 @@ impl TraceFuser {
     }
 
     /// Register an input tensor.
-    pub fn input_quantized_unhandled(&mut self, tensor: &TensorIr) -> Option<(FuseArg, FuseArg)> {
+    pub fn input_quantized_unhandled(
+        &mut self,
+        tensor: &TensorIr,
+    ) -> Option<(FuseArg, FuseArg, Option<FuseArg>)> {
         if self.resources.indexed.contains_key(&tensor.id) {
             panic!("Can't add a new input that is already used in an index operation");
         }
         self.resources.outputs.update(tensor);
 
         let precision = tensor.dtype.into();
-        let precision_scales = match tensor.dtype {
-            DType::QFloat(scheme) => match scheme.param {
-                QuantParam::F32 => FuseType::F32,
-                QuantParam::F16 => FuseType::F16,
-                QuantParam::BF16 => FuseType::BF16,
-                QuantParam::UE8M0 | QuantParam::UE4M3 => {
-                    unimplemented!("Unsupported fuse precision");
-                }
-            },
+        let (precision_scales, is_affine) = match tensor.dtype {
+            DType::QFloat(scheme) => {
+                let prec = match scheme.param {
+                    QuantParam::F32 => FuseType::F32,
+                    QuantParam::F16 => FuseType::F16,
+                    QuantParam::BF16 => FuseType::BF16,
+                    QuantParam::UE8M0 | QuantParam::UE4M3 => {
+                        unimplemented!("Unsupported fuse precision");
+                    }
+                };
+                (prec, scheme.mode == QuantMode::Affine)
+            }
             _ => return None,
         };
 
-        let (new_input, q_index) = self.resources.inputs.insert_quant(tensor.clone());
+        let (new_input, q_index, b_index) = self
+            .resources
+            .inputs
+            .insert_quant(tensor.clone(), is_affine);
         let input = FuseArg::Input(new_input, precision, LayoutInfo::Unknown);
         let scales = FuseArg::Input(q_index, precision_scales, LayoutInfo::Unknown);
+        let biases = b_index.map(|pos| FuseArg::Input(pos, precision_scales, LayoutInfo::Unknown));
 
         self.resources.inputs_unhandled.push(tensor.id);
-        Some((input, scales))
+        Some((input, scales, biases))
     }
 
     /// Register an input tensor.

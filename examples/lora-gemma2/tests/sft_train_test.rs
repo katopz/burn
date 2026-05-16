@@ -2088,6 +2088,361 @@ mod quantized_test {
         }
     }
 
+    /// LM head NaN isolation: proves the NaN comes from buffer pool stale data, NOT the LM head.
+    ///
+    /// Key findings from `test_q4f_affine_block64_gemma2_2b_scale`:
+    /// - Forward-only with clean pool: CLEAN
+    /// - Forward+backward (autodiff+LoRA): NaN loss
+    /// - Forward-only after backward: NaN (pool corrupted)
+    ///
+    /// This test isolates the exact source:
+    /// - Phase A1: First forward (clean pool) → CLEAN
+    /// - Phase A2: Second forward (pool has stale data from A1) → NaN if buffer pool bug
+    /// - Phase A3: Third forward → CLEAN if A2 refreshed the pool
+    ///
+    /// CONFIRMED: The NaN originates from SlicedPool reusing freed buffers without zeroing.
+    /// The quantized matmul dequantize path reads stale GPU memory as scale/bias values.
+    ///
+    /// Run with:
+    ///   cargo test --features metal -p lora-gemma2 --test sft_train_test -- \
+    ///     test_lm_head_nan_forward_vs_backward --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_lm_head_nan_forward_vs_backward() {
+        use burn::nn::lora::{LoraBias, LoraConfig};
+        use burn::tensor::FloatDType;
+        use burn::tensor::activation::log_softmax;
+        use burn::tensor::quantization::{BlockSize, QuantMode};
+        use lora_gemma2::LoraTarget;
+
+        let device = quant_device();
+
+        let config =
+            Gemma2Config::new(256, 2304, 2, 9216, 8, 4, 256).with_query_pre_attn_scalar(256);
+
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q4F)
+            .with_mode(QuantMode::Affine)
+            .with_level(QuantLevel::Block(BlockSize::new([64])));
+
+        fn make_lora_quant_model(
+            config: &Gemma2Config,
+            scheme: QuantScheme,
+            device: &QuantDevice,
+        ) -> Gemma2ModelLora<QuantAD> {
+            let model = Gemma2Model::<QuantBackend>::new(config, device);
+            let mut quantizer = Quantizer {
+                calibration: Calibration::MinMax,
+                scheme,
+            };
+            let quantized = model.quantize_weights(&mut quantizer);
+            let ad_model = Gemma2Model::<QuantAD>::from_inner(quantized);
+            let lora_config = LoraConfig::new(16)
+                .with_alpha(32.0)
+                .with_bias(LoraBias::None);
+            apply_lora_to_gemma2(ad_model, &lora_config, LoraTarget::all_targets(), device)
+        }
+
+        fn check_tensor(label: &str, tensor: &Tensor<QuantAD, 3>) -> usize {
+            let data = tensor.clone().into_data();
+            let vals: Vec<f32> = data.iter::<f32>().collect();
+            let nan_count = vals.iter().filter(|v: &&f32| !v.is_finite()).count();
+            let sum: f32 = vals.iter().sum();
+            let total = vals.len();
+            eprintln!(
+                "[{label}] shape={:?}, nan={nan_count}/{total}, sum={sum:.6}",
+                tensor.dims(),
+            );
+            nan_count
+        }
+
+        fn check_tensor_no_ad(label: &str, tensor: &Tensor<QuantBackend, 3>) -> usize {
+            let data = tensor.clone().into_data();
+            let vals: Vec<f32> = data.iter::<f32>().collect();
+            let nan_count = vals.iter().filter(|v: &&f32| !v.is_finite()).count();
+            let sum: f32 = vals.iter().sum();
+            let total = vals.len();
+            eprintln!(
+                "[{label}] shape={:?}, nan={nan_count}/{total}, sum={sum:.6}",
+                tensor.dims(),
+            );
+            nan_count
+        }
+
+        let input_data: Vec<i64> = (1..=64i64).map(|t| t % 256 + 1).collect();
+        let input_shape = [1, 64];
+
+        // Phase A0b: Forward with NO autodiff, NO LoRA (MUST be first — clean pool baseline)
+        eprintln!("=== Phase A0b: Forward no autodiff, no LoRA (FIRST — clean pool baseline) ===");
+        {
+            let model = Gemma2Model::<QuantBackend>::new(&config, &device);
+            let mut quantizer = Quantizer {
+                calibration: Calibration::MinMax,
+                scheme,
+            };
+            let quantized = model.quantize_weights(&mut quantizer);
+
+            let input_ids: Tensor<QuantBackend, 2, Int> =
+                Tensor::from_data(TensorData::new(input_data.clone(), input_shape), &device);
+            let logits = quantized.forward(input_ids);
+            let nan_count = check_tensor_no_ad("phase-a0b", &logits);
+            if nan_count > 0 {
+                eprintln!("[phase-a0b] FAIL: NaN in baseline forward with CLEAN pool!");
+                eprintln!("[phase-a0b] This means the NaN is NOT from buffer pool stale data.");
+                eprintln!(
+                    "[phase-a0b] The NaN is produced deterministically by the quantized forward pass itself."
+                );
+            } else {
+                eprintln!("[phase-a0b] OK: Clean baseline — NaN must come from later phases");
+            }
+        }
+
+        // Phase A0c: Step-by-step trace using forward_hidden + manual LM head/softcap
+        eprintln!("\n=== Phase A0c: Step-by-step trace (no autodiff, no LoRA) ===");
+        {
+            let model = Gemma2Model::<QuantBackend>::new(&config, &device);
+            let mut quantizer = Quantizer {
+                calibration: Calibration::MinMax,
+                scheme,
+            };
+            let quantized = model.quantize_weights(&mut quantizer);
+
+            let input_ids: Tensor<QuantBackend, 2, Int> =
+                Tensor::from_data(TensorData::new(input_data.clone(), input_shape), &device);
+
+            // Step 1: forward_hidden (embedding → blocks → final norm)
+            let hidden = quantized.forward_hidden(input_ids);
+            let h_data = hidden.clone().into_data();
+            let h_vals: Vec<f32> = h_data.iter::<f32>().collect();
+            let h_nan = h_vals.iter().filter(|v: &&f32| !v.is_finite()).count();
+            let h_sum: f32 = h_vals.iter().sum();
+            eprintln!(
+                "[phase-a0c] forward_hidden: shape={:?}, nan={h_nan}/{}, sum={h_sum:.6}",
+                hidden.dims(),
+                h_vals.len()
+            );
+
+            // Step 2: LM head linear only (no softcapping)
+            let logits_raw = quantized.lm_head.forward(hidden.clone());
+            let d = logits_raw.clone().into_data();
+            let v: Vec<f32> = d.iter::<f32>().collect();
+            let nan = v.iter().filter(|x: &&f32| !x.is_finite()).count();
+            let sum: f32 = v.iter().sum();
+            eprintln!(
+                "[phase-a0c] lm_head (raw): shape={:?}, nan={nan}/{}, sum={sum:.6}",
+                logits_raw.dims(),
+                v.len()
+            );
+
+            // Step 3: Softcapping only
+            let logits_capped = logits_raw
+                .clone()
+                .cast(FloatDType::F32)
+                .div_scalar(quantized.final_logit_softcapping)
+                .tanh()
+                .mul_scalar(quantized.final_logit_softcapping);
+            let d = logits_capped.clone().into_data();
+            let v: Vec<f32> = d.iter::<f32>().collect();
+            let nan = v.iter().filter(|x: &&f32| !x.is_finite()).count();
+            let sum: f32 = v.iter().sum();
+            eprintln!(
+                "[phase-a0c] softcap: shape={:?}, nan={nan}/{}, sum={sum:.6}",
+                logits_capped.dims(),
+                v.len()
+            );
+
+            // Step 4: For comparison, full forward
+            let input_ids2: Tensor<QuantBackend, 2, Int> =
+                Tensor::from_data(TensorData::new(input_data.clone(), input_shape), &device);
+            let logits_full = quantized.forward(input_ids2);
+            let d = logits_full.into_data();
+            let v: Vec<f32> = d.iter::<f32>().collect();
+            let nan = v.iter().filter(|x: &&f32| !x.is_finite()).count();
+            eprintln!("[phase-a0c] full forward: shape=[1, 64, 256], nan={nan}/16384");
+
+            // Summary
+            if h_nan == 0 && nan > 0 {
+                eprintln!("[phase-a0c] NaN starts in LM head or softcapping (hidden is clean)");
+            } else if h_nan > 0 {
+                eprintln!("[phase-a0c] NaN starts in transformer blocks (hidden already NaN)");
+            }
+        }
+
+        // Phase A0: Forward with autodiff but NO LoRA (isolates LoRA as variable)
+        eprintln!("\n=== Phase A0: Forward with autodiff, NO LoRA ===");
+        {
+            let model = Gemma2Model::<QuantBackend>::new(&config, &device);
+            let mut quantizer = Quantizer {
+                calibration: Calibration::MinMax,
+                scheme,
+            };
+            let quantized = model.quantize_weights(&mut quantizer);
+            let ad_model = Gemma2Model::<QuantAD>::from_inner(quantized);
+
+            let input_ids: Tensor<QuantAD, 2, Int> =
+                Tensor::from_data(TensorData::new(input_data.clone(), input_shape), &device);
+            let logits = ad_model.forward(input_ids);
+            let nan_count = check_tensor("phase-a0", &logits);
+            if nan_count > 0 {
+                eprintln!("[phase-a0] FAIL: NaN without LoRA — bug is in base quantized forward");
+            } else {
+                eprintln!("[phase-a0] OK: Clean without LoRA — LoRA layers trigger the NaN");
+            }
+        }
+
+        // Phase A1: First forward with autodiff+LoRA
+        eprintln!("\n=== Phase A1: First forward with autodiff+LoRA ===");
+        {
+            let lora_model = make_lora_quant_model(&config, scheme, &device);
+            let input_ids: Tensor<QuantAD, 2, Int> =
+                Tensor::from_data(TensorData::new(input_data.clone(), input_shape), &device);
+            let logits = lora_model.forward(input_ids);
+            let nan_count = check_tensor("phase-a1", &logits);
+            if nan_count > 0 {
+                eprintln!("[phase-a1] FAIL: NaN with LoRA!");
+            } else {
+                eprintln!("[phase-a1] OK: Clean with LoRA");
+            }
+            // logits dropped here — buffers freed back to pool with stale data
+        }
+
+        // Phase A2: Second forward — pool has stale data from A1
+        eprintln!("\n=== Phase A2: Second forward (pool has stale data from A1) ===");
+        {
+            let lora_model = make_lora_quant_model(&config, scheme, &device);
+            let input_ids: Tensor<QuantAD, 2, Int> =
+                Tensor::from_data(TensorData::new(input_data.clone(), input_shape), &device);
+            let logits = lora_model.forward(input_ids);
+            let nan_count = check_tensor("phase-a2", &logits);
+            if nan_count > 0 {
+                eprintln!("[phase-a2] FAIL: NaN from stale buffer pool data (A1 polluted it)");
+                eprintln!("[phase-a2] CONFIRMED: SlicedPool stale data -> quantized matmul NaN");
+            } else {
+                eprintln!("[phase-a2] OK: No stale data issue (or different buffer sizes)");
+            }
+        }
+
+        // Phase A3: Third forward — check if A2 refreshed the pool
+        eprintln!("\n=== Phase A3: Third forward (after A2 refreshed pool) ===");
+        {
+            let lora_model = make_lora_quant_model(&config, scheme, &device);
+            let input_ids: Tensor<QuantAD, 2, Int> =
+                Tensor::from_data(TensorData::new(input_data.clone(), input_shape), &device);
+            let logits = lora_model.forward(input_ids);
+            let nan_count = check_tensor("phase-a3", &logits);
+            if nan_count > 0 {
+                eprintln!("[phase-a3] FAIL: Still NaN (deterministic pool corruption)");
+            } else {
+                eprintln!("[phase-a3] OK: Clean (A2's allocations refreshed the pool)");
+            }
+        }
+
+        // Phase B: Forward + backward (step by step)
+        eprintln!("\n=== Phase B: Forward + backward (step by step) ===");
+        {
+            let lora_model = make_lora_quant_model(&config, scheme, &device);
+            let sft_model = Gemma2ForSFT::new(lora_model, 0, false);
+            let batch = make_quant_batch(1, 64, &device);
+
+            let logits = sft_model.model.forward(batch.tokens_inputs.clone());
+            let l_nan = check_tensor("phase-b-logits", &logits);
+
+            let [batch_size, seq_len, _vocab_size] = logits.dims();
+            let logits_f32 = logits.clone().cast(FloatDType::F32);
+            let log_probs = log_softmax(logits_f32, 2);
+            let lp_data = log_probs.clone().into_data();
+            let lp_vals: Vec<f32> = lp_data.iter::<f32>().collect();
+            let lp_nan = lp_vals.iter().filter(|v: &&f32| !v.is_finite()).count();
+            eprintln!("[phase-b-log_probs] nan={lp_nan}/{}", lp_vals.len());
+
+            let target_indices = batch.targets.clone().reshape([batch_size, seq_len, 1]);
+            let token_losses = log_probs
+                .gather(2, target_indices)
+                .reshape([batch_size, seq_len])
+                .neg();
+            let tl_data = token_losses.clone().into_data();
+            let tl_vals: Vec<f32> = tl_data.iter::<f32>().collect();
+            let tl_nan = tl_vals.iter().filter(|v: &&f32| !v.is_finite()).count();
+            eprintln!("[phase-b-token_losses] nan={tl_nan}/{}", tl_vals.len());
+
+            let loss = token_losses.mean();
+            let loss_val: f32 = loss.clone().into_scalar().elem();
+            eprintln!("[phase-b-loss] {loss_val:.6}");
+
+            if !loss_val.is_finite() {
+                eprintln!("[phase-b] FAIL: NaN in loss! Source:");
+                if l_nan > 0 {
+                    eprintln!("  -> logits (forward pass — stale buffer pool)");
+                } else if lp_nan > 0 {
+                    eprintln!("  -> log_softmax");
+                } else if tl_nan > 0 {
+                    eprintln!("  -> gather/neg");
+                } else {
+                    eprintln!("  -> mean reduction");
+                }
+            } else {
+                eprintln!("[phase-b] OK: Loss is finite ({loss_val:.6})");
+                let _grads = loss.backward();
+                eprintln!("[phase-b] backward() completed");
+            }
+        }
+
+        // Phase C: Forward-only after backward (no autodiff)
+        eprintln!("\n=== Phase C: Forward-only after backward (no autodiff) ===");
+        {
+            let model = Gemma2Model::<QuantBackend>::new(&config, &device);
+            let mut quantizer = Quantizer {
+                calibration: Calibration::MinMax,
+                scheme,
+            };
+            let quantized = model.quantize_weights(&mut quantizer);
+            let input_ids: Tensor<QuantBackend, 2, Int> =
+                Tensor::from_data(TensorData::new(input_data.clone(), input_shape), &device);
+            let logits = quantized.forward(input_ids);
+            let data = logits.into_data();
+            let vals: Vec<f32> = data.iter::<f32>().collect();
+            let nan_count = vals.iter().filter(|v: &&f32| !v.is_finite()).count();
+            let sum: f32 = vals.iter().sum();
+            eprintln!("[phase-c] nan={nan_count}/{}, sum={sum:.6}", vals.len());
+            if nan_count > 0 {
+                eprintln!("[phase-c] FAIL: Pool corrupted by backward pass");
+            } else {
+                eprintln!("[phase-c] OK: Pool is clean");
+            }
+        }
+
+        // Phase D: Isolated quantized linear repeat
+        eprintln!("\n=== Phase D: Isolated quantized linear [2304,256] repeat ===");
+        {
+            use burn::nn::{Linear, LinearConfig};
+
+            let linear: Linear<QuantBackend> =
+                LinearConfig::new(2304, 256).with_bias(false).init(&device);
+            let mut quantizer = Quantizer {
+                calibration: Calibration::MinMax,
+                scheme,
+            };
+            let quantized = linear.quantize_weights(&mut quantizer);
+            let input: Tensor<QuantBackend, 2> = Tensor::random(
+                [64, 2304],
+                burn::tensor::Distribution::Normal(0.0, 0.02),
+                &device,
+            );
+
+            for i in 0..5 {
+                let output: Tensor<QuantBackend, 2> = quantized.forward(input.clone());
+                let data = output.into_data();
+                let vals: Vec<f32> = data.iter::<f32>().collect();
+                let nan_count = vals.iter().filter(|v: &&f32| !v.is_finite()).count();
+                let sum: f32 = vals.iter().sum();
+                eprintln!(
+                    "[phase-d] iter {i}: nan={nan_count}/{}, sum={sum:.6}",
+                    vals.len()
+                );
+            }
+        }
+    }
+
     /// Gemma 2 2B Q4F affine block-64 full-scale validation + buffer pool diagnostics.
     ///
     /// **CONFIRMED FINDING**: The bias fix (commit 5f39624b2) DOES resolve NaN at Gemma 2 2B

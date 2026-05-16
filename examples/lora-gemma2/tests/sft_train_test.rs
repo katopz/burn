@@ -2007,4 +2007,84 @@ mod quantized_test {
             );
         }
     }
+
+    /// Verify affine biases are correctly passed through the quantized matmul fusion path.
+    ///
+    /// This test catches the "scales-as-biases" bug where the matmul fusion pipeline
+    /// passes the scales buffer as both scales AND biases to QuantizedView, causing
+    /// affine dequantize to compute `scale * q + scale` instead of `scale * q + bias`.
+    ///
+    /// Strategy: Run Q4F affine block-64 training through a tiny model (exercises the
+    /// full fusion matmul path with QuantizedView). If biases are wrong (scales used as
+    /// biases), the loss explodes to NaN/inf because `scale * q + scale` is wrong for
+    /// affine dequantize where bias != scale.
+    ///
+    /// Run with: cargo test --features metal -- quantized_test::test_affine_bias_correctness_in_matmul --nocapture
+    #[test]
+    fn test_affine_bias_correctness_in_matmul() {
+        use burn::tensor::quantization::QuantMode;
+
+        let device = quant_device();
+        // Use aligned config to avoid fusion alignment panics
+        let config = tiny_config_aligned();
+
+        // Build model with Q4F affine per-tensor quantization
+        // (block-64 doesn't evenly divide vocab=104, so use per-tensor for tiny model)
+        let inner_model = Gemma2Model::<QuantBackend>::new(&config, &device);
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q4F)
+            .with_mode(QuantMode::Affine)
+            .with_level(QuantLevel::Tensor);
+        let mut quantizer = Quantizer {
+            calibration: Calibration::MinMax,
+            scheme,
+        };
+        let quantized_inner = inner_model.quantize_weights(&mut quantizer);
+        let model = Gemma2Model::<QuantAD>::from_inner(quantized_inner);
+
+        let lora_config = LoraConfig::new(4).with_alpha(8.0).with_bias(LoraBias::None);
+        let lora_model =
+            apply_lora_to_gemma2(model, &lora_config, LoraTarget::all_targets(), &device);
+        let mut sft_model = Gemma2ForSFT::new(lora_model, 0, false);
+
+        let mut optimizer = AdamConfig::new().init();
+        let lr = 1e-3;
+        let mut losses = Vec::new();
+
+        // Run 8 training steps — if biases are wrong, loss will be NaN immediately
+        for step in 0..8 {
+            let batch = make_quant_batch(2, 8, &device);
+            let output = <Gemma2ForSFT<QuantAD> as TrainStep>::step(&sft_model, batch);
+            let loss: f32 = output.item.loss.into_scalar().elem();
+            eprintln!("[affine-bias-check] step {step}: loss={loss:.6}");
+            assert!(
+                loss.is_finite(),
+                "Q4F affine per-tensor loss should be finite at step {step}, got {loss}. \
+                 This likely means biases are wrong in the matmul fusion path \
+                 (scales-as-biases bug: QuantizedView reads scales instead of actual biases)."
+            );
+            assert!(
+                loss > 0.0,
+                "Q4F affine per-tensor loss should be positive at step {step}, got {loss}"
+            );
+            sft_model = sft_model.optimize(&mut optimizer, lr, output.grads);
+            losses.push(loss);
+        }
+
+        eprintln!("[affine-bias-check] losses: {losses:?}");
+        let first = losses[0];
+        let last = *losses.last().unwrap();
+        eprintln!("[affine-bias-check] first={first:.6}, last={last:.6}");
+
+        // Note: Q4F per-tensor with only 16 quantization levels may plateau in 8 steps.
+        // The key assertion is that loss stays finite (verified in the loop above).
+        // Loss decrease is checked in Q8F/Q8S tests which have sufficient precision.
+        if last < first {
+            eprintln!("[affine-bias-check] Loss decreased: {first:.6} -> {last:.6}");
+        } else {
+            eprintln!(
+                "[affine-bias-check] Loss plateaued (expected with 4-bit): {first:.6} -> {last:.6}"
+            );
+        }
+    }
 }

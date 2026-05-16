@@ -59,11 +59,12 @@ impl<R: Runtime> OperationFuser<CubeOptimization<R>> for MatmulFuser<R> {
                 // Precision shouldn't be hardcoded but I don't know how to get float precision of the backend
                 let lhs = match op.lhs.dtype {
                     DType::QFloat(scheme) => {
-                        let (data, scales, _biases) =
+                        let (data, scales, biases) =
                             self.fuser.input_quantized_unhandled(&op.lhs).unwrap();
                         MatmulArg::Quantized {
                             data,
                             scales,
+                            biases,
                             precision: op.out.dtype.into(),
                             scheme,
                         }
@@ -72,11 +73,12 @@ impl<R: Runtime> OperationFuser<CubeOptimization<R>> for MatmulFuser<R> {
                 };
                 let rhs = match op.rhs.dtype {
                     DType::QFloat(scheme) => {
-                        let (data, scales, _biases) =
+                        let (data, scales, biases) =
                             self.fuser.input_quantized_unhandled(&op.rhs).unwrap();
                         MatmulArg::Quantized {
                             data,
                             scales,
+                            biases,
                             precision: op.out.dtype.into(),
                             scheme,
                         }

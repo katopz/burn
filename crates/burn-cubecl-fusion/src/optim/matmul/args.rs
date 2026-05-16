@@ -289,7 +289,12 @@ fn global_view<E: CubePrimitive>(
 
     match comptime![arg.clone()] {
         MatmulArg::Normal(_) => View::new::<GlobalInput, Coords1d>(&data_buf, data_layout),
-        MatmulArg::Quantized { scales, scheme, .. } => {
+        MatmulArg::Quantized {
+            scales,
+            biases,
+            scheme,
+            ..
+        } => {
             let scales_layout = match comptime![scheme.level] {
                 QuantLevel::Tensor => GlobalScaleLayout::new_PerTensor(shape),
                 QuantLevel::Block(block_size) => {
@@ -320,7 +325,57 @@ fn global_view<E: CubePrimitive>(
                     ))
                 }
             };
-            let scales_buf = GlobalInput::new(inputs, locals, scales, config, None);
+            // For affine mode: use actual biases buffer
+            // For symmetric mode: reuse scales as dummy (biases ignored in dequantize)
+            let biases_fuse_arg = comptime![match biases {
+                Some(b) => b,
+                None => scales.clone(),
+            }];
+
+            // Construct biases layout BEFORE buffer creation to avoid borrow-after-move.
+            // Same structure as scales layout, but separate instance because GlobalScaleLayout
+            // cannot be cloned in cube context.
+            let biases_layout = match comptime![scheme.level] {
+                QuantLevel::Tensor => GlobalScaleLayout::new_PerTensor(shape),
+                QuantLevel::Block(block_size) => {
+                    let block_size = comptime![block_size.as_dim::<2>()];
+
+                    let biases_arg = comptime![MatmulArg::Normal(biases_fuse_arg.clone())];
+                    let batch_layout = input_batch_layout(
+                        inputs,
+                        batch_shape,
+                        biases_arg,
+                        comptime![config.clone()],
+                    );
+
+                    let biases_inner_layout = global_layout(
+                        inputs,
+                        shape,
+                        batch_layout,
+                        comptime![biases_fuse_arg.clone()],
+                        comptime![config.clone()],
+                        1usize,
+                        layout_config,
+                        1u32,
+                    );
+                    GlobalScaleLayout::new_BlockScaled(BlockScaledLayout::new(
+                        shape,
+                        biases_inner_layout,
+                        comptime![(block_size[0] as u32, block_size[1] as u32)],
+                    ))
+                }
+            };
+
+            // Now create buffers (after layout construction, since comptime values get moved)
+            let scales_buf =
+                GlobalInput::new(inputs, locals, scales, comptime![config.clone()], None);
+            let biases_buf = GlobalInput::new(
+                inputs,
+                locals,
+                biases_fuse_arg,
+                comptime![config.clone()],
+                None,
+            );
 
             // Redefine because of `Numeric` bound, kinda hacky but I can't figure out a way to
             // assert `Vector<T: Numeric>::Scalar: Numeric`
@@ -329,7 +384,9 @@ fn global_view<E: CubePrimitive>(
                 data_buf,
                 data_layout,
                 scales_buf,
+                biases_buf,
                 scales_layout,
+                biases_layout,
                 scheme,
             );
             // Safety: should be fine since `Vector<E::Scalar, N>` is guaranteed equal to `E`
@@ -406,7 +463,9 @@ struct CreateQuantView<'a, E: Numeric, N: Size> {
     data_buf: GlobalInputExpand,
     data_layout: GlobalLayoutExpand,
     scales_buf: GlobalInputExpand,
+    biases_buf: GlobalInputExpand,
     scales_layout: GlobalScaleLayoutExpand,
+    biases_layout: GlobalScaleLayoutExpand,
     scheme: QuantScheme,
     _ty: PhantomData<(E, N)>,
 }
@@ -420,7 +479,9 @@ impl<'a, E: Numeric, N: Size> RunWithQuantType for CreateQuantView<'a, E, N> {
             self.data_buf,
             self.data_layout,
             self.scales_buf,
+            self.biases_buf,
             self.scales_layout,
+            self.biases_layout,
             self.scheme,
         )
     }
@@ -432,7 +493,9 @@ fn create_quant_view_dynamic<E: Numeric, N: Size>(
     data_buf: GlobalInput,
     data_layout: GlobalLayout,
     scales_buf: GlobalInput,
+    biases_buf: GlobalInput,
     scales_layout: GlobalScaleLayout,
+    biases_layout: GlobalScaleLayout,
     #[comptime] scheme: QuantScheme,
 ) -> View<Vector<E, N>, BatchedCoords> {
     intrinsic!(|scope| {
@@ -441,7 +504,9 @@ fn create_quant_view_dynamic<E: Numeric, N: Size>(
             data_buf,
             data_layout,
             scales_buf,
+            biases_buf,
             scales_layout,
+            biases_layout,
             scheme,
             _ty: PhantomData,
         };
@@ -454,16 +519,22 @@ fn create_quant_view<E: Numeric, N: Size, Q: Scalar, S: Scalar>(
     data_buf: GlobalInput,
     data_layout: GlobalLayout,
     scales_buf: GlobalInput,
+    biases_buf: GlobalInput,
     scales_layout: GlobalScaleLayout,
+    biases_layout: GlobalScaleLayout,
     #[comptime] scheme: QuantScheme,
 ) -> View<Vector<E, N>, BatchedCoords> {
     let size!(NQ) = N::value().comptime() / scheme.num_quants();
 
     let data_view: View<Vector<Q, NQ>, BatchedCoords> =
         View::new::<GlobalInput, Coords1d>(&data_buf, data_layout);
+    // Scales and biases each get their own layout instance (same structure, separate ownership)
     let scales_view: View<S, BatchedCoords> =
         View::new::<GlobalInput, Coords1d>(&scales_buf, scales_layout);
-    QuantizedView::new(data_view, scales_view, scales_view, scheme).view()
+    let biases_view: View<S, BatchedCoords> =
+        View::new::<GlobalInput, Coords1d>(&biases_buf, biases_layout);
+
+    QuantizedView::new(data_view, scales_view, biases_view, scheme).view()
 }
 
 #[derive(CubeType)]
@@ -539,6 +610,7 @@ pub enum MatmulArg {
     Quantized {
         data: FuseArg,
         scales: FuseArg,
+        biases: Option<FuseArg>,
         precision: FuseType,
         scheme: QuantScheme,
     },

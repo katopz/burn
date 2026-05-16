@@ -1279,4 +1279,732 @@ mod quantized_test {
             );
         }
     }
+
+    /// Diagnostic test for Q4F affine block-64 intermittent NaN (~15% failure rate).
+    ///
+    /// Runs the roundtrip 200 times across multiple tensor sizes to catch the intermittent bug.
+    /// At each iteration, checks the dequantized float values to isolate whether NaN originates in:
+    ///   a) The quantize kernel (corrupt packed u32 values)
+    ///   b) The dequantize kernel (corrupt float output from valid packed values)
+    ///   c) The scale/bias computation (zero scale → div-by-zero)
+    ///
+    /// Also compares against Q4S block-64 symmetric as a control — Q4S should
+    /// never produce NaN since it uses the same packed kernel path minus the bias term.
+    ///
+    /// This test is #[ignore]d by default — run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn test_q4f_affine_block64_intermittent_nan_diagnostic() {
+        use burn::tensor::Distribution;
+        use burn::tensor::quantization::{BlockSize, QuantMode};
+
+        let device = quant_device();
+        let scheme_affine = QuantScheme::default()
+            .with_value(QuantValue::Q4F)
+            .with_mode(QuantMode::Affine)
+            .with_level(QuantLevel::Block(BlockSize::new([64])));
+        let scheme_symmetric = QuantScheme::default()
+            .with_value(QuantValue::Q4S)
+            .with_level(QuantLevel::Block(BlockSize::new([64])));
+
+        // Multiple tensor sizes to increase coverage
+        let tensor_sizes: &[[usize; 2]] = &[
+            [256, 512],  // standard weight shape
+            [512, 256],  // transposed weight
+            [256, 256],  // square weight
+            [128, 1024], // wide weight
+            [1024, 128], // tall weight
+            [512, 512],  // larger square
+        ];
+
+        let mut affine_failures = 0usize;
+        let mut symmetric_failures = 0usize;
+        let total_runs = 200u32;
+
+        for run in 0..total_runs {
+            // Cycle through tensor sizes
+            let size = tensor_sizes[run as usize % tensor_sizes.len()];
+            // Create fresh tensor each run (Normal distribution, no fixed seed)
+            let tensor: Tensor<QuantBackend, 2> =
+                Tensor::random(size, Distribution::Normal(0.0, 0.02), &device);
+
+            // --- Affine roundtrip ---
+            let quantized = tensor.clone().quantize_dynamic(&scheme_affine);
+            let dequantized: Tensor<QuantBackend, 2> = quantized.clone().dequantize();
+            let deq_sum: f32 = dequantized.clone().sum().into_scalar().elem();
+
+            if !deq_sum.is_finite() {
+                affine_failures += 1;
+                // Count how many values are NaN/inf
+                let total = size[0] * size[1];
+                let flat = dequantized.reshape([total]);
+                let data = flat.to_data();
+                let nan_count = data.iter::<f32>().filter(|v| !v.is_finite()).count();
+
+                log::error!(
+                    "[q4f-affine-diag] run {run}: NaN! shape={size:?}, deq_sum={deq_sum}, \
+                     {nan_count}/{total} non-finite floats"
+                );
+
+                // Also try re-quantizing the SAME tensor to see if it's deterministic
+                let retry_quantized = tensor.clone().quantize_dynamic(&scheme_affine);
+                let retry_deq: Tensor<QuantBackend, 2> = retry_quantized.dequantize();
+                let retry_sum: f32 = retry_deq.clone().sum().into_scalar().elem();
+                log::info!(
+                    "[q4f-affine-diag] run {run}: retry with same tensor: sum={retry_sum}, finite={}",
+                    retry_sum.is_finite()
+                );
+            }
+
+            // --- Symmetric roundtrip (control) ---
+            let sym_quantized = tensor.clone().quantize_dynamic(&scheme_symmetric);
+            let sym_deq: Tensor<QuantBackend, 2> = sym_quantized.dequantize();
+            let sym_sum: f32 = sym_deq.clone().sum().into_scalar().elem();
+
+            if !sym_sum.is_finite() {
+                symmetric_failures += 1;
+                log::error!(
+                    "[q4s-symmetric-diag] run {run}: NaN! sym_sum={sym_sum} \
+                     (THIS IS UNEXPECTED — Q4S block-64 should be stable)"
+                );
+            }
+        }
+
+        log::info!(
+            "[diag] affine failures: {affine_failures}/{total_runs}, \
+             symmetric failures: {symmetric_failures}/{total_runs}"
+        );
+
+        // This test is informational — we don't assert pass/fail.
+        // The goal is to measure the failure rate and compare affine vs symmetric.
+        if affine_failures > 0 {
+            log::warn!(
+                "[diag] Q4F affine block-64 has {affine_failures}/{total_runs} failures ({:.1}%)",
+                affine_failures as f64 / total_runs as f64 * 100.0
+            );
+        }
+        if symmetric_failures > 0 {
+            log::error!(
+                "[diag] Q4S symmetric block-64 has {symmetric_failures}/{total_runs} failures — \
+                 this indicates a deeper packed kernel issue, not affine-specific"
+            );
+        }
+    }
+
+    /// Fixed-seed variant of the intermittent NaN diagnostic.
+    ///
+    /// Creates ONE tensor with a fixed seed, then quantize→dequantize it 200 times.
+    /// - If this NEVER fails → bug is data-dependent (only certain weight patterns trigger it)
+    /// - If this DOES fail intermittently → bug is GPU-scheduling-dependent (race/memory reuse)
+    ///
+    /// Run with: cargo test --features metal -- quantized_test::test_q4f_affine_block64_fixed_seed --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_q4f_affine_block64_fixed_seed() {
+        use burn::tensor::Distribution;
+        use burn::tensor::quantization::{BlockSize, QuantMode};
+
+        let device = quant_device();
+
+        // Fixed seed for reproducibility — same tensor every time
+        QuantBackend::seed(&device, 42);
+        let tensor: Tensor<QuantBackend, 2> =
+            Tensor::random([256, 512], Distribution::Normal(0.0, 0.02), &device);
+
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q4F)
+            .with_mode(QuantMode::Affine)
+            .with_level(QuantLevel::Block(BlockSize::new([64])));
+
+        // Snapshot the original data for verification
+        let orig_sum: f32 = tensor.clone().sum().into_scalar().elem();
+        log::info!("[fixed-seed] original tensor sum={orig_sum:.6}");
+
+        let total_runs: usize = 200;
+        let mut failures = 0usize;
+        let mut first_failure_run: Option<usize> = None;
+
+        for run in 0..total_runs {
+            let quantized = tensor.clone().quantize_dynamic(&scheme);
+            let dequantized: Tensor<QuantBackend, 2> = quantized.dequantize();
+            let deq_sum: f32 = dequantized.clone().sum().into_scalar().elem();
+
+            if !deq_sum.is_finite() {
+                failures += 1;
+                if first_failure_run.is_none() {
+                    first_failure_run = Some(run);
+                }
+                let flat = dequantized.reshape([256 * 512]);
+                let nan_count = flat
+                    .to_data()
+                    .iter::<f32>()
+                    .filter(|v| !v.is_finite())
+                    .count();
+                log::error!(
+                    "[fixed-seed] run {run}: NaN! deq_sum={deq_sum}, {nan_count}/131072 non-finite"
+                );
+            }
+        }
+
+        log::info!(
+            "[fixed-seed] {failures}/{total_runs} failures, first failure at run {:?}",
+            first_failure_run
+        );
+
+        if failures > 0 && failures < total_runs {
+            log::warn!(
+                "[fixed-seed] INTERMITTENT with SAME DATA → bug is GPU-scheduling-dependent \
+                 (not data-dependent). {failures}/{total_runs} failures ({:.1}%)",
+                failures as f64 / total_runs as f64 * 100.0
+            );
+        } else if failures == total_runs {
+            log::warn!(
+                "[fixed-seed] ALWAYS FAILS with this data → bug is data-dependent. \
+                 Use seed 42 to reproduce."
+            );
+        } else {
+            log::info!(
+                "[fixed-seed] NEVER FAILS → this data pattern doesn't trigger the bug. \
+                 Bug may be data-dependent with a different seed."
+            );
+        }
+    }
+
+    /// Multi-seed sweep to find data patterns that trigger the Q4F affine block-64 NaN bug.
+    ///
+    /// Tests seeds 0–100, each with a single quantize→dequantize roundtrip.
+    /// Reports which seeds produce NaN and which don't, then does 20 repeated
+    /// roundtrips on each failing seed to confirm the failure is deterministic
+    /// (data-dependent) vs intermittent (GPU-scheduling-dependent).
+    ///
+    /// Run with: cargo test --features metal -- quantized_test::test_q4f_affine_block64_seed_sweep --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_q4f_affine_block64_seed_sweep() {
+        use burn::tensor::Distribution;
+        use burn::tensor::quantization::{BlockSize, QuantMode};
+
+        let device = quant_device();
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q4F)
+            .with_mode(QuantMode::Affine)
+            .with_level(QuantLevel::Block(BlockSize::new([64])));
+
+        let mut failing_seeds: Vec<u64> = Vec::new();
+        let max_seed: u64 = 100;
+
+        for seed in 0..=max_seed {
+            QuantBackend::seed(&device, seed);
+            let tensor: Tensor<QuantBackend, 2> =
+                Tensor::random([256, 512], Distribution::Normal(0.0, 0.02), &device);
+
+            let quantized = tensor.clone().quantize_dynamic(&scheme);
+            let dequantized: Tensor<QuantBackend, 2> = quantized.dequantize();
+            let deq_sum: f32 = dequantized.clone().sum().into_scalar().elem();
+
+            if !deq_sum.is_finite() {
+                failing_seeds.push(seed);
+                let flat = dequantized.reshape([256 * 512]);
+                let nan_count = flat
+                    .to_data()
+                    .iter::<f32>()
+                    .filter(|v| !v.is_finite())
+                    .count();
+                eprintln!(
+                    "[seed-sweep] seed {seed}: NaN! deq_sum={deq_sum}, {nan_count}/131072 non-finite"
+                );
+            }
+        }
+
+        eprintln!(
+            "[seed-sweep] {}/{} seeds produce NaN: {:?}",
+            failing_seeds.len(),
+            max_seed + 1,
+            failing_seeds
+        );
+
+        // For each failing seed, repeat 20 times to check determinism
+        for &seed in &failing_seeds {
+            let mut repeat_failures = 0usize;
+            let repeat_count = 20usize;
+            for _ in 0..repeat_count {
+                QuantBackend::seed(&device, seed);
+                let tensor: Tensor<QuantBackend, 2> =
+                    Tensor::random([256, 512], Distribution::Normal(0.0, 0.02), &device);
+                let quantized = tensor.clone().quantize_dynamic(&scheme);
+                let dequantized: Tensor<QuantBackend, 2> = quantized.dequantize();
+                let deq_sum: f32 = dequantized.clone().sum().into_scalar().elem();
+                if !deq_sum.is_finite() {
+                    repeat_failures += 1;
+                }
+            }
+            eprintln!(
+                "[seed-sweep] seed {seed}: {repeat_failures}/{repeat_count} failures on repeat"
+            );
+        }
+
+        if failing_seeds.is_empty() {
+            eprintln!(
+                "[seed-sweep] No failing seeds found in range 0–{max_seed}. \
+                 Bug may require larger tensors or different distribution."
+            );
+        }
+    }
+
+    /// Root-cause analysis: inspect scales/biases for passing (seed 0) vs failing (seed 1) seeds.
+    ///
+    /// The seed sweep revealed that 100/101 seeds produce NaN deterministically.
+    /// Only seed 0 passes. This test dumps the scale/bias statistics for both
+    /// to identify whether the issue is:
+    ///   a) Zero scales (max == min in a block → scale = 0 → div-by-zero)
+    ///   b) Extremely small scales (f16 underflow)
+    ///   c) NaN/inf in scale/bias computation itself
+    ///   d) Something else in the packed quantize kernel
+    ///
+    /// Run with: cargo test --features metal -- quantized_test::test_q4f_affine_block64_scale_inspect --ignored --nocapture
+    /// Root-cause analysis: inspect scales/biases for passing (seed 0) vs failing (seed 1) seeds.
+    ///
+    /// The seed sweep revealed that 100/101 seeds produce NaN deterministically.
+    /// Only seed 0 passes. This test compares:
+    ///   - Q4F affine block-64 (failing)
+    ///   - Q4F affine per-tensor (passing — control for packed u32 without blocks)
+    ///   - Q4S symmetric block-64 (control for packed u32 block-64 without affine bias)
+    /// This isolates whether the bug is in the shared packed block-64 path or
+    /// specifically in the affine bias handling.
+    ///
+    /// Run with: cargo test --features metal -- quantized_test::test_q4f_affine_block64_scale_inspect --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_q4f_affine_block64_scale_inspect() {
+        use burn::tensor::Distribution;
+        use burn::tensor::quantization::{
+            BlockSize, Calibration, QuantMode, compute_q_params, compute_range,
+        };
+
+        let device = quant_device();
+        let scheme_block = QuantScheme::default()
+            .with_value(QuantValue::Q4F)
+            .with_mode(QuantMode::Affine)
+            .with_level(QuantLevel::Block(BlockSize::new([64])));
+        let scheme_tensor = QuantScheme::default()
+            .with_value(QuantValue::Q4F)
+            .with_mode(QuantMode::Affine)
+            .with_level(QuantLevel::Tensor);
+        // Symmetric block-64 control — same packed u32 kernel, no bias
+        let scheme_sym_block = QuantScheme::default()
+            .with_value(QuantValue::Q4S)
+            .with_level(QuantLevel::Block(BlockSize::new([64])));
+
+        for seed in [0u64, 1, 2] {
+            eprintln!("\n=== seed {seed} ===");
+
+            // Test with Normal(0, 0.02) — the failing distribution
+            QuantBackend::seed(&device, seed);
+            let tensor: Tensor<QuantBackend, 2> =
+                Tensor::random([256, 512], Distribution::Normal(0.0, 0.02), &device);
+
+            // Dump tensor data stats
+            let tensor_data = tensor.clone().into_data();
+            let vals: Vec<f32> = tensor_data.iter().collect();
+            let val_min = vals.iter().cloned().fold(f32::INFINITY, f32::min);
+            let val_max = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let val_mean: f32 =
+                vals.iter().filter(|v| v.is_finite()).sum::<f32>() / vals.len() as f32;
+            eprintln!(
+                "[scale-inspect] seed {seed} Normal(0,0.02): data range=[{val_min:.6}, {val_max:.6}], mean={val_mean:.6}"
+            );
+
+            // Compute range and qparams at Tensor level
+            let range = compute_range(&scheme_block, &tensor, &Calibration::MinMax);
+            let qparams = compute_q_params(&scheme_block, range);
+
+            let scales_data = qparams.scales.clone().into_data();
+            let biases_data = qparams.biases.clone().unwrap().into_data();
+            let scales: Vec<f32> = scales_data.iter().collect();
+            let biases: Vec<f32> = biases_data.iter().collect();
+
+            let scale_nan = scales.iter().filter(|v| !v.is_finite()).count();
+            let bias_nan = biases.iter().filter(|v| !v.is_finite()).count();
+            let zero_scale = scales.iter().filter(|&&v| v == 0.0f32).count();
+            let tiny_scale = scales.iter().filter(|&&v| v > 0.0f32 && v < 1e-6).count();
+            let scale_min = scales
+                .iter()
+                .cloned()
+                .filter(|v| v.is_finite())
+                .fold(f32::INFINITY, f32::min);
+            let scale_max = scales
+                .iter()
+                .cloned()
+                .filter(|v| v.is_finite())
+                .fold(f32::NEG_INFINITY, f32::max);
+
+            eprintln!(
+                "[scale-inspect] seed {seed} block-64: {n_scales} scales, range=[{scale_min:.8e}, {scale_max:.8e}], {scale_nan} NaN, {zero_scale} zero, {tiny_scale} tiny",
+                n_scales = scales.len()
+            );
+            eprintln!(
+                "[scale-inspect] seed {seed} block-64: {} biases, {bias_nan} NaN",
+                biases.len()
+            );
+            eprintln!(
+                "[scale-inspect] seed {seed} block-64: first 5 scales: {:?}",
+                &scales[..5.min(scales.len())]
+            );
+            eprintln!(
+                "[scale-inspect] seed {seed} block-64: first 5 biases: {:?}",
+                &biases[..5.min(biases.len())]
+            );
+
+            // Block-64 roundtrip
+            let q_block = tensor.clone().quantize_dynamic(&scheme_block);
+            let dq_block: Tensor<QuantBackend, 2> = q_block.dequantize();
+            let sum_block: f32 = dq_block.clone().sum().into_scalar().elem();
+            let nan_block = dq_block
+                .clone()
+                .into_data()
+                .iter::<f32>()
+                .filter(|v| !v.is_finite())
+                .count();
+
+            // Per-tensor roundtrip (control for packed u32 without blocks)
+            let q_tensor = tensor.clone().quantize_dynamic(&scheme_tensor);
+            let dq_tensor: Tensor<QuantBackend, 2> = q_tensor.dequantize();
+            let sum_tensor: f32 = dq_tensor.clone().sum().into_scalar().elem();
+            let nan_tensor = dq_tensor
+                .clone()
+                .into_data()
+                .iter::<f32>()
+                .filter(|v| !v.is_finite())
+                .count();
+
+            // Symmetric block-64 roundtrip (control for packed u32 block-64 without affine bias)
+            let q_sym = tensor.clone().quantize_dynamic(&scheme_sym_block);
+            let dq_sym: Tensor<QuantBackend, 2> = q_sym.dequantize();
+            let sum_sym: f32 = dq_sym.clone().sum().into_scalar().elem();
+            let nan_sym = dq_sym
+                .clone()
+                .into_data()
+                .iter::<f32>()
+                .filter(|v| !v.is_finite())
+                .count();
+
+            eprintln!(
+                "[scale-inspect] seed {seed}: Q4F affine block-64 roundtrip sum={sum_block}, finite={}, {nan_block}/131072 NaN",
+                sum_block.is_finite()
+            );
+            eprintln!(
+                "[scale-inspect] seed {seed}: Q4F affine per-tensor roundtrip sum={sum_tensor}, finite={}, {nan_tensor}/131072 NaN",
+                sum_tensor.is_finite()
+            );
+            eprintln!(
+                "[scale-inspect] seed {seed}: Q4S symmetric block-64 roundtrip sum={sum_sym}, finite={}, {nan_sym}/131072 NaN",
+                sum_sym.is_finite()
+            );
+
+            // Diagnosis logic
+            if !sum_block.is_finite() && sum_tensor.is_finite() && sum_sym.is_finite() {
+                eprintln!(
+                    "[scale-inspect] seed {seed}: BUG IS AFFINE-SPECIFIC — packed block-64 kernel \
+                     fails only with affine bias (symmetric + per-tensor both pass)"
+                );
+            } else if !sum_block.is_finite() && !sum_sym.is_finite() {
+                eprintln!(
+                    "[scale-inspect] seed {seed}: BUG IS IN SHARED PACKED BLOCK-64 PATH — both \
+                     affine and symmetric fail (not affine-specific)"
+                );
+            } else if !sum_block.is_finite() && sum_sym.is_finite() {
+                eprintln!(
+                    "[scale-inspect] seed {seed}: BUG IS IN AFFINE BLOCK-64 PATH — symmetric \
+                     block-64 passes but affine block-64 fails"
+                );
+            }
+        }
+    }
+
+    /// Isolate quantize vs dequantize as the NaN source for Q4F affine block-64.
+    ///
+    /// Previous tests confirmed:
+    /// - 100/101 seeds fail deterministically (seed 0 passes)
+    /// - Scales/biases are valid (no NaN, no zero scales)
+    /// - Q4S symmetric block-64 passes, Q4F affine per-tensor passes
+    /// - Bug is affine-specific to the packed block-64 path
+    ///
+    /// This test isolates whether NaN originates in:
+    ///   a) The quantize kernel (packed u32 output is corrupt)
+    ///   b) The dequantize kernel (valid packed u32 → NaN during unpack+rescale)
+    ///   c) The out_scale/out_bias write path (scales/biases corrupted during kernel write)
+    ///
+    /// Strategy:
+    /// 1. Quantize with Q4F affine block-64, dequantize with Q4F affine per-tensor
+    ///    (forces per-tensor dequantize on block-64 packed data — if NaN, quantize is broken)
+    /// 2. Quantize with Q4S symmetric block-64, dequantize with Q4F affine block-64
+    ///    (forces affine dequantize on symmetric-packed data — if NaN, dequantize is broken)
+    /// 3. Dump the quantized tensor's stored scales/biases via the QParams handle
+    ///    (check if the kernel wrote them correctly)
+    ///
+    /// Run with: cargo test --features metal -- quantized_test::test_q4f_affine_block64_quantize_vs_dequantize --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_q4f_affine_block64_quantize_vs_dequantize() {
+        use burn::tensor::Distribution;
+        use burn::tensor::quantization::{BlockSize, QuantMode};
+
+        let device = quant_device();
+
+        let scheme_affine_block = QuantScheme::default()
+            .with_value(QuantValue::Q4F)
+            .with_mode(QuantMode::Affine)
+            .with_level(QuantLevel::Block(BlockSize::new([64])));
+        let scheme_affine_tensor = QuantScheme::default()
+            .with_value(QuantValue::Q4F)
+            .with_mode(QuantMode::Affine)
+            .with_level(QuantLevel::Tensor);
+        let scheme_sym_block = QuantScheme::default()
+            .with_value(QuantValue::Q4S)
+            .with_level(QuantLevel::Block(BlockSize::new([64])));
+
+        // Use seed 1 (known to fail affine block-64 in sweep)
+        // Note: seed must be set on QuantBackend (Metal<f16,i64>) for Tensor::random to be deterministic
+        QuantBackend::seed(&device, 1);
+        let tensor: Tensor<QuantBackend, 2> =
+            Tensor::random([256, 512], Distribution::Normal(0.0, 0.02), &device);
+
+        // --- Step 1: Full affine block-64 roundtrip (baseline — should fail) ---
+        let q_affine_block = tensor.clone().quantize_dynamic(&scheme_affine_block);
+        let dq_affine_block: Tensor<QuantBackend, 2> = q_affine_block.clone().dequantize();
+        let sum_affine_block: f32 = dq_affine_block.clone().sum().into_scalar().elem();
+        let nan_affine_block = dq_affine_block
+            .into_data()
+            .iter::<f32>()
+            .filter(|v| !v.is_finite())
+            .count();
+        eprintln!(
+            "[quant-vs-dequant] Q4F affine block-64 roundtrip: sum={sum_affine_block}, finite={}, {nan_affine_block}/131072 NaN",
+            sum_affine_block.is_finite()
+        );
+
+        // --- Step 3: Compare with Q4F affine per-tensor (control — should pass) ---
+        let q_affine_tensor = tensor.clone().quantize_dynamic(&scheme_affine_tensor);
+        let dq_affine_tensor: Tensor<QuantBackend, 2> = q_affine_tensor.dequantize();
+        let sum_affine_tensor: f32 = dq_affine_tensor.clone().sum().into_scalar().elem();
+        eprintln!(
+            "[quant-vs-dequant] Q4F affine per-tensor roundtrip: sum={sum_affine_tensor}, finite={}",
+            sum_affine_tensor.is_finite()
+        );
+
+        // --- Step 4: Compare with Q4S symmetric block-64 (control — should pass) ---
+        let q_sym_block = tensor.clone().quantize_dynamic(&scheme_sym_block);
+        let dq_sym_block: Tensor<QuantBackend, 2> = q_sym_block.dequantize();
+        let sum_sym_block: f32 = dq_sym_block.clone().sum().into_scalar().elem();
+        eprintln!(
+            "[quant-vs-dequant] Q4S symmetric block-64 roundtrip: sum={sum_sym_block}, finite={}",
+            sum_sym_block.is_finite()
+        );
+
+        // --- Step 5: Check the raw quantized packed values ---
+        // If the packed u32 values are all 0xFFFFFFFF or similar, the quantize kernel is broken.
+        // If the packed values look reasonable, the dequantize kernel is broken.
+        // We can't easily read the packed u32 values directly, but we can check the
+        // dequantized output pattern: if NaN appears in regular blocks of 64,
+        // it's likely a scale/bias indexing issue. If it's scattered, it's a packed value issue.
+        if !sum_affine_block.is_finite() {
+            // Re-do the roundtrip and analyze the NaN pattern
+            let q = tensor.clone().quantize_dynamic(&scheme_affine_block);
+            let dq: Tensor<QuantBackend, 2> = q.dequantize();
+            let dq_data = dq.into_data();
+            let vals: Vec<f32> = dq_data.iter().collect();
+
+            // Check NaN pattern by blocks of 64
+            let mut blocks_with_nan = 0usize;
+            let mut blocks_without_nan = 0usize;
+            let total_blocks = 256 * 8; // 2048 blocks
+            for block_idx in 0..total_blocks {
+                let row = block_idx / 8;
+                let block_in_row = block_idx % 8;
+                let start = row * 512 + block_in_row * 64;
+                let end = start + 64;
+                let has_nan = vals[start..end].iter().any(|v| !v.is_finite());
+                if has_nan {
+                    blocks_with_nan += 1;
+                } else {
+                    blocks_without_nan += 1;
+                }
+            }
+
+            eprintln!(
+                "[quant-vs-dequant] NaN pattern: {blocks_with_nan}/{total_blocks} blocks have NaN, {blocks_without_nan} clean"
+            );
+
+            if blocks_with_nan > 0 && blocks_without_nan > 0 {
+                eprintln!(
+                    "[quant-vs-dequant] PARTIAL CORRUPTION — some blocks affected, others clean. \
+                     Suggests data-dependent issue in specific blocks."
+                );
+            } else if blocks_with_nan == total_blocks {
+                eprintln!(
+                    "[quant-vs-dequant] TOTAL CORRUPTION — all blocks have NaN. \
+                     Suggests systematic issue in the kernel."
+                );
+            }
+
+            // Check if NaN blocks follow a regular pattern (e.g., every other block)
+            let first_16_blocks: Vec<bool> = (0..16)
+                .map(|block_idx| {
+                    let row = block_idx / 8;
+                    let block_in_row = block_idx % 8;
+                    let start = row * 512 + block_in_row * 64;
+                    vals[start..start + 64].iter().any(|v| !v.is_finite())
+                })
+                .collect();
+            eprintln!("[quant-vs-dequant] First 16 blocks NaN pattern: {first_16_blocks:?}");
+        }
+    }
+
+    /// Confirm GPU state pollution: seed 1 alone passes, but seed 0 → seed 1 fails.
+    ///
+    /// The seed sweep showed 100/101 seeds fail when run in a loop (seed 0 first).
+    /// But running seed 1 alone passes. This test proves the bug is caused by
+    /// GPU state pollution from a preceding quantize operation.
+    ///
+    /// Test plan:
+    /// 1. Run seed 1 alone (fresh GPU state) → expect PASS
+    /// 2. Run seed 0 (passes, but may leave polluted GPU state)
+    /// 3. Run seed 1 again (same data, same code) → expect FAIL
+    ///
+    /// If step 3 fails, the bug is in Metal buffer pool reuse or kernel
+    /// compilation caching, NOT in the data or the kernel logic itself.
+    ///
+    /// Run with: cargo test --features metal -- quantized_test::test_q4f_affine_block64_state_pollution --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_q4f_affine_block64_state_pollution() {
+        use burn::tensor::Distribution;
+        use burn::tensor::quantization::{BlockSize, QuantMode};
+
+        let device = quant_device();
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q4F)
+            .with_mode(QuantMode::Affine)
+            .with_level(QuantLevel::Block(BlockSize::new([64])));
+
+        // --- Step 1: Seed 1 alone (fresh GPU state) ---
+        QuantBackend::seed(&device, 1);
+        let tensor_seed1: Tensor<QuantBackend, 2> =
+            Tensor::random([256, 512], Distribution::Normal(0.0, 0.02), &device);
+        let q1 = tensor_seed1.clone().quantize_dynamic(&scheme);
+        let dq1: Tensor<QuantBackend, 2> = q1.dequantize();
+        let sum1: f32 = dq1.clone().sum().into_scalar().elem();
+        let nan1 = dq1
+            .into_data()
+            .iter::<f32>()
+            .filter(|v| !v.is_finite())
+            .count();
+        eprintln!(
+            "[state-pollution] Step 1: seed 1 alone → sum={sum1}, finite={}, {nan1} NaN",
+            sum1.is_finite()
+        );
+
+        // --- Step 2: Run seed 0 (the "passing" seed that may pollute state) ---
+        QuantBackend::seed(&device, 0);
+        let tensor_seed0: Tensor<QuantBackend, 2> =
+            Tensor::random([256, 512], Distribution::Normal(0.0, 0.02), &device);
+        let q0 = tensor_seed0.quantize_dynamic(&scheme);
+        let dq0: Tensor<QuantBackend, 2> = q0.dequantize();
+        let sum0: f32 = dq0.clone().sum().into_scalar().elem();
+        let nan0 = dq0
+            .into_data()
+            .iter::<f32>()
+            .filter(|v| !v.is_finite())
+            .count();
+        eprintln!(
+            "[state-pollution] Step 2: seed 0 → sum={sum0}, finite={}, {nan0} NaN",
+            sum0.is_finite()
+        );
+
+        // --- Step 2.5: Force GPU sync to see if pending ops cause the pollution ---
+        QuantBackend::sync(&device).unwrap();
+        eprintln!("[state-pollution] Step 2.5: GPU sync after seed 0");
+
+        // --- Step 3: Re-run seed 1 (same data as step 1, but GPU state may be polluted) ---
+        QuantBackend::seed(&device, 1);
+        let tensor_seed1_again: Tensor<QuantBackend, 2> =
+            Tensor::random([256, 512], Distribution::Normal(0.0, 0.02), &device);
+        let q1b = tensor_seed1_again.quantize_dynamic(&scheme);
+        let dq1b: Tensor<QuantBackend, 2> = q1b.dequantize();
+        let sum1b: f32 = dq1b.clone().sum().into_scalar().elem();
+        let nan1b = dq1b
+            .into_data()
+            .iter::<f32>()
+            .filter(|v| !v.is_finite())
+            .count();
+        eprintln!(
+            "[state-pollution] Step 3: seed 1 after seed 0 → sum={sum1b}, finite={}, {nan1b} NaN",
+            sum1b.is_finite()
+        );
+
+        // --- Diagnosis ---
+        let step1_pass = sum1.is_finite();
+        let step2_pass = sum0.is_finite();
+        let step3_pass = sum1b.is_finite();
+
+        eprintln!();
+        if step1_pass && !step3_pass {
+            eprintln!(
+                "[state-pollution] CONFIRMED: GPU state pollution even after sync! \
+                 Seed 1 passes alone (step 1) but fails after seed 0 + sync (step 3). \
+                 The bug is in Metal buffer pool reuse, NOT pending GPU ops."
+            );
+        } else if !step1_pass && !step3_pass {
+            eprintln!(
+                "[state-pollution] Seed 1 always fails — bug is data-dependent, not state-dependent. \
+                 (Contradicts earlier sweep results — re-check seed setup.)"
+            );
+        } else if step1_pass && step3_pass {
+            eprintln!(
+                "[state-pollution] FIXED BY SYNC! Seed 1 passes after sync. \
+                 The bug was caused by pending GPU operations from seed 0 not completing \
+                 before seed 1's compute_range/quantize reads the buffers. \
+                 This is a race condition in the GPU command queue, not buffer pool reuse."
+            );
+        } else {
+            eprintln!(
+                "[state-pollution] Unexpected: step1={step1_pass}, step2={step2_pass}, step3={step3_pass}"
+            );
+        }
+
+        // Also test: does running seed 0 MULTIPLE times make it worse?
+        eprintln!("\n[state-pollution] Running seed 0 ten times to amplify state pollution...");
+        for i in 0..10 {
+            QuantBackend::seed(&device, 0);
+            let t: Tensor<QuantBackend, 2> =
+                Tensor::random([256, 512], Distribution::Normal(0.0, 0.02), &device);
+            let dq: Tensor<QuantBackend, 2> = t.quantize_dynamic(&scheme).dequantize();
+            let _ = dq;
+            eprintln!("[state-pollution]   seed 0 iteration {i} done");
+        }
+
+        // Now try seed 1 again after 10 iterations of seed 0
+        QuantBackend::seed(&device, 1);
+        let tensor_final: Tensor<QuantBackend, 2> =
+            Tensor::random([256, 512], Distribution::Normal(0.0, 0.02), &device);
+        let q_final = tensor_final.quantize_dynamic(&scheme);
+        let dq_final: Tensor<QuantBackend, 2> = q_final.dequantize();
+        let sum_final: f32 = dq_final.clone().sum().into_scalar().elem();
+        let nan_final = dq_final
+            .into_data()
+            .iter::<f32>()
+            .filter(|v| !v.is_finite())
+            .count();
+        eprintln!(
+            "[state-pollution] Seed 1 after 10x seed 0: sum={sum_final}, finite={}, {nan_final} NaN",
+            sum_final.is_finite()
+        );
+
+        if !sum_final.is_finite() {
+            eprintln!(
+                "[state-pollution] After 10 iterations of seed 0, seed 1 now fails. \
+                 State pollution is cumulative — GPU buffer reuse degrades over time."
+            );
+        }
+    }
 }

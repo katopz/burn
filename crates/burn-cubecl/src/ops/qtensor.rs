@@ -167,10 +167,28 @@ fn new_quantized<R: CubeRuntime>(
                 ]),
             }
         }
-        // Affine empty: allocate data + biases + scales
-        (None, true) => client.empty_tensors(vec![data_desc, biases_desc.unwrap(), scales_desc]),
-        // Symmetric empty: allocate data + scales
-        (None, false) => client.empty_tensors(vec![data_desc, scales_desc]),
+        // Affine empty: allocate data + biases + scales (zero-initialized)
+        // Workaround: Metal GPU buffer pool reuse causes stale data in Q4F affine block-64
+        // when buffers are not explicitly initialized. See plan 017 Task 5.6.
+        (None, true) => {
+            let values_bytes =
+                Bytes::from_bytes_vec(vec![0u8; shape_value.num_elements() * data_size]);
+            let params_bytes =
+                Bytes::from_bytes_vec(vec![0u8; scales_shape.num_elements() * scales_dtype.size()]);
+            client.create_tensors(vec![
+                (data_desc, values_bytes),
+                (biases_desc.unwrap(), params_bytes.clone()),
+                (scales_desc, params_bytes),
+            ])
+        }
+        // Symmetric empty: allocate data + scales (zero-initialized)
+        (None, false) => {
+            let values_bytes =
+                Bytes::from_bytes_vec(vec![0u8; shape_value.num_elements() * data_size]);
+            let scales_bytes =
+                Bytes::from_bytes_vec(vec![0u8; scales_shape.num_elements() * scales_dtype.size()]);
+            client.create_tensors(vec![(data_desc, values_bytes), (scales_desc, scales_bytes)])
+        }
     };
 
     // Extract tensors in reverse order: scales (last), biases (middle), data (first)

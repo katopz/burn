@@ -353,6 +353,10 @@ enum QuantizeScheme {
     Q4S,
     /// 8-bit symmetric quantization.
     Q8S,
+    /// 8-bit affine quantization (per-tensor scale + bias, native i8 storage).
+    Q8fAffine,
+    /// 4-bit affine quantization with per-tensor scale + bias (packed u32 storage).
+    Q4fAffineTensor,
     /// 4-bit affine quantization with per-block scales+biases.
     Q4fAffine,
 }
@@ -363,6 +367,8 @@ impl QuantizeScheme {
             "none" => Some(Self::None),
             "q4s" => Some(Self::Q4S),
             "q8s" => Some(Self::Q8S),
+            "q8f_affine" => Some(Self::Q8fAffine),
+            "q4f_affine_tensor" => Some(Self::Q4fAffineTensor),
             "q4f_affine" => Some(Self::Q4fAffine),
             _ => None,
         }
@@ -391,7 +397,7 @@ fn print_usage() {
     eprintln!("  --val-split <F>          Validation split ratio (default: 0.1)");
     eprintln!("  --seed <N>               Random seed (default: 42)");
     eprintln!(
-        "  --quantize <SCHEME>      Quantize frozen weights: none, q4s, q8s, q4f_affine (default: none)"
+        "  --quantize <SCHEME>      Quantize frozen weights: none, q4s, q8s, q8f_affine, q4f_affine_tensor, q4f_affine (default: none)"
     );
     eprintln!("  --grad-accum <N>         Gradient accumulation steps (default: 4)");
     eprintln!("  --max-grad-norm <F>      Max gradient norm for clipping, 0=off (default: 1.0)");
@@ -629,7 +635,7 @@ fn run<B: SftBackend>(args: SftArgs, device: B::Device) {
     // -----------------------------------------------------------------------
     let quant_scheme = QuantizeScheme::from_str(&args.quantize).unwrap_or_else(|| {
         eprintln!(
-            "Error: unknown quantize scheme '{}'. Use: none, q4s, q8s, q4f_affine",
+            "Error: unknown quantize scheme '{}'. Use: none, q4s, q8s, q8f_affine, q4f_affine_tensor, q4f_affine",
             args.quantize
         );
         std::process::exit(1);
@@ -654,6 +660,36 @@ fn run<B: SftBackend>(args: SftArgs, device: B::Device) {
             log::info!("[5b/8] Quantizing frozen weights to Q8S (8-bit symmetric)");
             let scheme = QuantScheme::default()
                 .with_value(QuantValue::Q8S)
+                .with_level(QuantLevel::Tensor);
+            let mut quantizer = Quantizer {
+                calibration: Calibration::MinMax,
+                scheme,
+            };
+            let quantized = inner_model.quantize_weights(&mut quantizer);
+            log::info!("  Quantization complete");
+            quantized
+        }
+        QuantizeScheme::Q8fAffine => {
+            log::info!("[5b/8] Quantizing frozen weights to Q8F affine (8-bit affine, per-tensor)");
+            let scheme = QuantScheme::default()
+                .with_value(QuantValue::Q8F)
+                .with_mode(QuantMode::Affine)
+                .with_level(QuantLevel::Tensor);
+            let mut quantizer = Quantizer {
+                calibration: Calibration::MinMax,
+                scheme,
+            };
+            let quantized = inner_model.quantize_weights(&mut quantizer);
+            log::info!("  Quantization complete");
+            quantized
+        }
+        QuantizeScheme::Q4fAffineTensor => {
+            log::info!(
+                "[5b/8] Quantizing frozen weights to Q4F affine tensor (4-bit affine, per-tensor, packed u32)"
+            );
+            let scheme = QuantScheme::default()
+                .with_value(QuantValue::Q4F)
+                .with_mode(QuantMode::Affine)
                 .with_level(QuantLevel::Tensor);
             let mut quantizer = Quantizer {
                 calibration: Calibration::MinMax,

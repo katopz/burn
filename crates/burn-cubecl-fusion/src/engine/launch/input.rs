@@ -64,8 +64,9 @@ impl<'a, R: Runtime> InputPlanner<'a, R> {
                         )));
                 }
                 RegisterTensor::QuantValues(tensor_relative) => {
-                    let tensor_global = context.tensors.get(&tensor_relative.id).unwrap().clone();
-                    let handle = context
+                    let mut tensor_global =
+                        context.tensors.get(&tensor_relative.id).unwrap().clone();
+                    let mut handle = context
                         .handles
                         .get_handle(&tensor_global.id, &TensorStatus::ReadOnly);
 
@@ -73,19 +74,46 @@ impl<'a, R: Runtime> InputPlanner<'a, R> {
                         burn_std::DType::QFloat(scheme) => scheme,
                         _ => unreachable!("Can't have quant data without QFloat"),
                     };
-                    let params = handle.params(scheme).unwrap();
+                    let mut params = handle.params(scheme).unwrap();
                     let precision = tensor_relative.dtype.into();
                     let precision_scales = params.dtype.into();
 
                     let global_shape = tensor_global.shape.clone();
-                    let shape_params = params_shape(&global_shape, scheme.level);
+                    let mut shape_params = params_shape(&global_shape, scheme.level);
 
                     // Extract biases before moving handle (affine mode)
-                    let biases_handle = if scheme.mode == QuantMode::Affine {
+                    let mut biases_handle = if scheme.mode == QuantMode::Affine {
                         handle.biases(scheme)
                     } else {
                         None
                     };
+
+                    // Pad quant tensors to match plan rank, same as Normal tensors.
+                    // Fixes rank mismatch in block-scaled layout where config.rank
+                    // (activation tensor rank) differs from quant tensor rank.
+                    let params_rank_orig = shape_params.rank();
+                    let num_elem_params: usize = shape_params.iter().product();
+
+                    if tensor_global.shape.rank() < plan.rank {
+                        let num_elem: usize = tensor_global.shape.iter().product();
+                        for _ in 0..(plan.rank - tensor_global.shape.rank()) {
+                            tensor_global.shape.insert(0, 1);
+                            handle.strides.insert(0, num_elem);
+                        }
+                    }
+                    if params_rank_orig < plan.rank {
+                        for _ in 0..(plan.rank - params_rank_orig) {
+                            shape_params.insert(0, 1);
+                            params.strides.insert(0, num_elem_params);
+                        }
+                    }
+                    if let Some(ref mut biases) = biases_handle
+                        && params_rank_orig < plan.rank
+                    {
+                        for _ in 0..(plan.rank - params_rank_orig) {
+                            biases.strides.insert(0, num_elem_params);
+                        }
+                    }
 
                     plan.handle_inputs
                         .push(HandleInput::QuantValues(QuantValuesHandleInput {

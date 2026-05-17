@@ -318,10 +318,16 @@ fn global_view<E: CubePrimitive>(
                         layout_config,
                         1u32,
                     );
+                    // Scale block_size by num_quants to match expanded coordinate space
+                    let nq = scheme.num_quants() as u32;
+                    let scaled_block = match comptime![layout_config.matrix_layout] {
+                        MatrixLayout::RowMajor => (block_size[0] as u32, block_size[1] as u32 * nq),
+                        MatrixLayout::ColMajor => (block_size[0] as u32 * nq, block_size[1] as u32),
+                    };
                     GlobalScaleLayout::new_BlockScaled(BlockScaledLayout::new(
                         shape,
                         scales_layout,
-                        comptime![(block_size[0] as u32, block_size[1] as u32)],
+                        comptime![scaled_block],
                     ))
                 }
             };
@@ -358,10 +364,16 @@ fn global_view<E: CubePrimitive>(
                         layout_config,
                         1u32,
                     );
+                    // Scale block_size by num_quants to match expanded coordinate space
+                    let nq = scheme.num_quants() as u32;
+                    let scaled_block = match comptime![layout_config.matrix_layout] {
+                        MatrixLayout::RowMajor => (block_size[0] as u32, block_size[1] as u32 * nq),
+                        MatrixLayout::ColMajor => (block_size[0] as u32 * nq, block_size[1] as u32),
+                    };
                     GlobalScaleLayout::new_BlockScaled(BlockScaledLayout::new(
                         shape,
                         biases_inner_layout,
-                        comptime![(block_size[0] as u32, block_size[1] as u32)],
+                        comptime![scaled_block],
                     ))
                 }
             };

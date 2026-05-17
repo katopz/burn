@@ -2172,8 +2172,187 @@ mod quantized_test {
         let input_data: Vec<i64> = (1..=64i64).map(|t| t % 256 + 1).collect();
         let input_shape = [1, 64];
 
-        // Phase A0b: Forward with NO autodiff, NO LoRA (MUST be first — clean pool baseline)
-        eprintln!("=== Phase A0b: Forward no autodiff, no LoRA (FIRST — clean pool baseline) ===");
+        // Phase A0-warmup: Run isolated quantized linears to populate the buffer pool
+        // with properly initialized data. If this fixes subsequent phases, the NaN is
+        // from the SlicedPool handing out uninitialized GPU memory pages.
+        eprintln!("=== Phase A0-warmup: Populate buffer pool with clean data ===");
+        {
+            use burn::nn::{Linear, LinearConfig};
+
+            // Systematically test [2304, out_dim] with various output sizes to find
+            // the threshold where NaN starts. All use input [64, 2304].
+            // Larger sizes (9216, 2304, 1024) are clean — we need to find the breakpoint.
+            let warmup_sizes: &[(usize, usize)] = &[
+                (2304, 9216), // gate_proj — known clean
+                (2304, 2304), // q_proj — known clean
+                (2304, 1024), // k_proj — known clean
+                (2304, 512),  // half of 1024
+                (2304, 256),  // lm_head — known NaN
+                (2304, 128),  // smaller
+                (2304, 64),   // even smaller
+                (9216, 2304), // down_proj — known clean
+                (256, 2304),  // transpose of lm_head
+                (512, 2304),  // transpose of half-k_proj
+            ];
+
+            for &(in_dim, out_dim) in warmup_sizes {
+                let linear: Linear<QuantBackend> = LinearConfig::new(in_dim, out_dim)
+                    .with_bias(false)
+                    .init(&device);
+                let mut q = Quantizer {
+                    calibration: Calibration::MinMax,
+                    scheme,
+                };
+                let quantized = linear.quantize_weights(&mut q);
+                let input: Tensor<QuantBackend, 2> = Tensor::random(
+                    [64, in_dim],
+                    burn::tensor::Distribution::Normal(0.0, 0.02),
+                    &device,
+                );
+                let output: Tensor<QuantBackend, 2> = quantized.forward(input);
+                let data = output.into_data();
+                let vals: Vec<f32> = data.iter::<f32>().collect();
+                let nan_count = vals.iter().filter(|v: &&f32| !v.is_finite()).count();
+                eprintln!(
+                    "[phase-warmup] [{in_dim},{out_dim}]: nan={nan_count}/{}",
+                    vals.len()
+                );
+                // output dropped here → buffers return to pool with VALID data
+            }
+
+            // Non-quantized control: test same dimensions with f16 linear
+            // If f16 is clean but Q4F is NaN → bug is in quantized matmul kernel
+            // If f16 is also NaN → bug is in general matmul or GPU memory
+            eprintln!("[phase-warmup] Non-quantized f16 control test:");
+            let f16_sizes: &[(usize, usize)] = &[
+                (2304, 256),  // known NaN in Q4F
+                (2304, 512),  // known NaN in Q4F
+                (2304, 1024), // known clean in Q4F
+            ];
+            for &(in_dim, out_dim) in f16_sizes {
+                let linear: Linear<QuantBackend> = LinearConfig::new(in_dim, out_dim)
+                    .with_bias(false)
+                    .init(&device);
+                // NO quantization — use f16 weights directly
+                let input: Tensor<QuantBackend, 2> = Tensor::random(
+                    [64, in_dim],
+                    burn::tensor::Distribution::Normal(0.0, 0.02),
+                    &device,
+                );
+                let output: Tensor<QuantBackend, 2> = linear.forward(input);
+                let data = output.into_data();
+                let vals: Vec<f32> = data.iter::<f32>().collect();
+                let nan_count = vals.iter().filter(|v: &&f32| !v.is_finite()).count();
+                eprintln!(
+                    "[phase-warmup] f16 [{in_dim},{out_dim}]: nan={nan_count}/{}",
+                    vals.len()
+                );
+            }
+
+            // Q8S (8-bit symmetric per-tensor) control test:
+            // Q8S has NO packing (native i8), NO bias term.
+            // If Q8S is clean → bug is in sub-byte packing (Q4F packed u32 path)
+            // If Q8S is NaN → bug is in general quantized matmul, not packing-specific
+            eprintln!("[phase-warmup] Q8S symmetric per-tensor control test:");
+            let scheme_q8s = QuantScheme::default()
+                .with_value(QuantValue::Q8S)
+                .with_mode(QuantMode::Symmetric)
+                .with_level(QuantLevel::Tensor);
+            for &(in_dim, out_dim) in &[(2304_usize, 256_usize), (2304, 512), (2304, 1024)] {
+                let linear: Linear<QuantBackend> = LinearConfig::new(in_dim, out_dim)
+                    .with_bias(false)
+                    .init(&device);
+                let mut q = Quantizer {
+                    calibration: Calibration::MinMax,
+                    scheme: scheme_q8s,
+                };
+                let quantized = linear.quantize_weights(&mut q);
+                let input: Tensor<QuantBackend, 2> = Tensor::random(
+                    [64, in_dim],
+                    burn::tensor::Distribution::Normal(0.0, 0.02),
+                    &device,
+                );
+                let output: Tensor<QuantBackend, 2> = quantized.forward(input);
+                let data = output.into_data();
+                let vals: Vec<f32> = data.iter::<f32>().collect();
+                let nan_count = vals.iter().filter(|v: &&f32| !v.is_finite()).count();
+                eprintln!(
+                    "[phase-warmup] Q8S [{in_dim},{out_dim}]: nan={nan_count}/{}",
+                    vals.len()
+                );
+            }
+
+            // Q8F affine per-tensor control test:
+            // Q8F has NO packing (native i8), but HAS bias term.
+            // If Q8F is clean but Q4F is NaN → bug is in sub-byte packing, not affine arithmetic
+            // If Q8F is NaN → bug may be in affine dequantize (scale*q + bias)
+            eprintln!("[phase-warmup] Q8F affine per-tensor control test:");
+            let scheme_q8f = QuantScheme::default()
+                .with_value(QuantValue::Q8F)
+                .with_mode(QuantMode::Affine)
+                .with_level(QuantLevel::Tensor);
+            for &(in_dim, out_dim) in &[(2304_usize, 256_usize), (2304, 512), (2304, 1024)] {
+                let linear: Linear<QuantBackend> = LinearConfig::new(in_dim, out_dim)
+                    .with_bias(false)
+                    .init(&device);
+                let mut q = Quantizer {
+                    calibration: Calibration::MinMax,
+                    scheme: scheme_q8f,
+                };
+                let quantized = linear.quantize_weights(&mut q);
+                let input: Tensor<QuantBackend, 2> = Tensor::random(
+                    [64, in_dim],
+                    burn::tensor::Distribution::Normal(0.0, 0.02),
+                    &device,
+                );
+                let output: Tensor<QuantBackend, 2> = quantized.forward(input);
+                let data = output.into_data();
+                let vals: Vec<f32> = data.iter::<f32>().collect();
+                let nan_count = vals.iter().filter(|v: &&f32| !v.is_finite()).count();
+                eprintln!(
+                    "[phase-warmup] Q8F [{in_dim},{out_dim}]: nan={nan_count}/{}",
+                    vals.len()
+                );
+            }
+
+            // Q4S symmetric block-64 control test:
+            // Q4S uses packed u32 (same as Q4F) but NO bias term.
+            // If Q4S is clean but Q4F is NaN → bug is in affine bias handling with packed data
+            // If Q4S is NaN → bug is in sub-byte packed dequantize, not bias-specific
+            eprintln!("[phase-warmup] Q4S symmetric block-64 control test:");
+            let scheme_q4s = QuantScheme::default()
+                .with_value(QuantValue::Q4S)
+                .with_mode(QuantMode::Symmetric)
+                .with_level(QuantLevel::Block(BlockSize::new([64])));
+            for &(in_dim, out_dim) in &[(2304_usize, 256_usize), (2304, 512), (2304, 1024)] {
+                let linear: Linear<QuantBackend> = LinearConfig::new(in_dim, out_dim)
+                    .with_bias(false)
+                    .init(&device);
+                let mut q = Quantizer {
+                    calibration: Calibration::MinMax,
+                    scheme: scheme_q4s,
+                };
+                let quantized = linear.quantize_weights(&mut q);
+                let input: Tensor<QuantBackend, 2> = Tensor::random(
+                    [64, in_dim],
+                    burn::tensor::Distribution::Normal(0.0, 0.02),
+                    &device,
+                );
+                let output: Tensor<QuantBackend, 2> = quantized.forward(input);
+                let data = output.into_data();
+                let vals: Vec<f32> = data.iter::<f32>().collect();
+                let nan_count = vals.iter().filter(|v: &&f32| !v.is_finite()).count();
+                eprintln!(
+                    "[phase-warmup] Q4S [{in_dim},{out_dim}]: nan={nan_count}/{}",
+                    vals.len()
+                );
+            }
+
+            eprintln!("[phase-warmup] Buffer pool now has pages with clean data");
+        }
+
+        // Phase A0b: Forward with NO autodiff, NO LoRA (after warmup — pool has clean data)
+        eprintln!("\n=== Phase A0b: Forward no autodiff, no LoRA (after warmup) ===");
         {
             let model = Gemma2Model::<QuantBackend>::new(&config, &device);
             let mut quantizer = Quantizer {
@@ -2265,6 +2444,40 @@ mod quantized_test {
                 eprintln!("[phase-a0c] NaN starts in LM head or softcapping (hidden is clean)");
             } else if h_nan > 0 {
                 eprintln!("[phase-a0c] NaN starts in transformer blocks (hidden already NaN)");
+            }
+
+            // Step 5: Fresh linear [2304,256] with same hidden states
+            // If this is clean → NaN is from the specific LM head weights/quantization
+            // If NaN → NaN is from the hidden states or buffer state
+            eprintln!("[phase-a0c] Testing FRESH quantized linear [2304,256] with clean hidden...");
+            use burn::nn::{Linear, LinearConfig};
+            let fresh_linear: Linear<QuantBackend> =
+                LinearConfig::new(2304, 256).with_bias(false).init(&device);
+            let mut fresh_q = Quantizer {
+                calibration: Calibration::MinMax,
+                scheme,
+            };
+            let fresh_quantized = fresh_linear.quantize_weights(&mut fresh_q);
+            // Reshape hidden [1, 64, 2304] -> [64, 2304] for linear input
+            let hidden_2d = hidden.reshape([64, 2304]);
+            let fresh_logits: Tensor<QuantBackend, 2> = fresh_quantized.forward(hidden_2d);
+            let fd = fresh_logits.into_data();
+            let fv: Vec<f32> = fd.iter::<f32>().collect();
+            let fnan = fv.iter().filter(|x: &&f32| !x.is_finite()).count();
+            let fsum: f32 = fv.iter().sum();
+            eprintln!(
+                "[phase-a0c] fresh linear: shape={:?}, nan={fnan}/{}, sum={fsum:.6}",
+                [64, 256],
+                fv.len()
+            );
+            if fnan > 0 {
+                eprintln!(
+                    "[phase-a0c] Fresh linear ALSO NaN → hidden states or buffer state is the issue"
+                );
+            } else {
+                eprintln!(
+                    "[phase-a0c] Fresh linear CLEAN → NaN is from the specific LM head weights/quantization"
+                );
             }
         }
 

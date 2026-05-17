@@ -997,14 +997,16 @@ where
             )
         } else {
             // Standard CE path: log_softmax → gather → neg (default, faster).
-            // burn's log_softmax handles f16 numerical stability internally.
-            // Materializes [batch*seq, 256K] log_probs (~4GB for seq=2048) but
+            // Cast to f32 before log_softmax — f16 overflows with 256K vocab
+            // (exp(30) ≈ 1e13 >> f16 max 65504, causes inf→NaN cascade).
+            // Materializes [batch*seq, 256K] log_probs in f32 (~8GB for seq=2048) but
             // ~20% faster than fused CE with f32 upcast.
             let logits = self.model.forward(batch.tokens_inputs);
             let [batch_size, seq_len, _vocab_size] = logits.dims();
 
+            let logits_f32 = logits.clone().cast(FloatDType::F32);
             let target_indices = targets.clone().reshape([batch_size, seq_len, 1]);
-            let token_losses = log_softmax(logits.clone(), 2)
+            let token_losses = log_softmax(logits_f32, 2)
                 .gather(2, target_indices)
                 .reshape([batch_size, seq_len])
                 .neg();

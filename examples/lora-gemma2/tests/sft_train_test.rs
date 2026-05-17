@@ -2348,6 +2348,51 @@ mod quantized_test {
                 );
             }
 
+            // Q4F affine block-64 bias inspection:
+            // The NaN is exclusive to Q4F affine block-64 (Q4S block-64 and Q8F affine are clean).
+            // Check if the quantized weight's scale/bias values are valid BEFORE the matmul.
+            // If scales/biases are clean → NaN comes from the matmul dequantize kernel
+            // If scales/biases have NaN → bug is in the quantization kernel itself
+            eprintln!("[phase-warmup] Q4F affine block-64 bias inspection:");
+            {
+                let linear: Linear<QuantBackend> =
+                    LinearConfig::new(2304, 256).with_bias(false).init(&device);
+                let mut q = Quantizer {
+                    calibration: Calibration::MinMax,
+                    scheme,
+                };
+                let quantized = linear.quantize_weights(&mut q);
+
+                // Access quantized weight properties via the tensor API
+                let weight = &quantized.weight;
+                let q_tensor = weight.val();
+
+                // Dequantize the entire weight to check for NaN at the tensor level
+                let deq: Tensor<QuantBackend, 2> = q_tensor.dequantize();
+                let deq_data = deq.into_data();
+                let deq_vals: Vec<f32> = deq_data.iter::<f32>().collect();
+                let deq_nan = deq_vals.iter().filter(|v: &&f32| !v.is_finite()).count();
+                let deq_sum: f32 = deq_vals.iter().sum();
+                eprintln!(
+                    "[phase-warmup] Q4F dequantized weight: shape={:?}, nan={deq_nan}/{}, sum={deq_sum:.6}",
+                    [2304, 256],
+                    deq_vals.len()
+                );
+
+                if deq_nan > 0 {
+                    eprintln!(
+                        "[phase-warmup] FAIL: Dequantized weight has NaN → bug in quantize/dequantize kernel, NOT matmul"
+                    );
+                } else {
+                    eprintln!(
+                        "[phase-warmup] OK: Dequantized weight is clean → NaN comes from the fused matmul dequantize path"
+                    );
+                    eprintln!(
+                        "[phase-warmup] The matmul kernel's QuantizedView reads stale GPU memory as bias values"
+                    );
+                }
+            }
+
             eprintln!("[phase-warmup] Buffer pool now has pages with clean data");
         }
 
@@ -2974,6 +3019,176 @@ mod quantized_test {
                     "[diag-8] forward-only clean — NaN must come from autodiff backward or LoRA layer"
                 );
             }
+        }
+    }
+    /// Diagnostic: double-quantize test to isolate non-determinism source.
+    ///
+    /// CONFIRMED FINDINGS (from previous runs):
+    ///   - compute_q_params ALWAYS produces finite scales/biases (stage_a=0)
+    ///   - Double DEQUANTIZE produces IDENTICAL results → no GPU read non-determinism
+    ///   - Sync doesn't fix it → NOT a GPU race condition
+    ///   - NaN counts are always multiples of 64 (block-aligned)
+    ///   - Q4F affine per-tensor: CLEAN, Q4S symmetric block-64: CLEAN
+    ///   - Bug is specific to Q4F affine block-64 combination
+    ///
+    /// This test quantizes the SAME tensor TWICE with explicit sync between,
+    /// then compares the two quantized outputs. This isolates whether the
+    /// non-determinism is:
+    ///   A) In the quantize computation itself (same input, different output)
+    ///   B) In the output memory allocation (different buffer pool state)
+    ///   C) In the input scale/bias read (buffer reuse corrupts input)
+    ///
+    /// Run with:
+    ///   cargo test --features metal -p lora-gemma2 --test sft_train_test -- \
+    ///     quantized_test::test_q4f_affine_block64_sync_diag --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_q4f_affine_block64_sync_diag() {
+        use burn::tensor::Distribution;
+        use burn::tensor::quantization::{BlockSize, QuantMode};
+
+        let device = quant_device();
+        let seed: u64 = 42;
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q4F)
+            .with_mode(QuantMode::Affine)
+            .with_level(QuantLevel::Block(BlockSize::new([64])));
+        let total_runs = 200usize;
+
+        // === Phase 1: Quantize TWICE on same input, compare dequantized outputs ===
+        eprintln!(
+            "=== Phase 1: Double quantize — same input, two independent quantize calls ===\n"
+        );
+
+        let mut both_clean = 0usize;
+        let mut both_nan = 0usize;
+        let mut first_only = 0usize;
+        let mut second_only = 0usize;
+        let mut both_nan_identical = 0usize;
+
+        for run in 0..total_runs {
+            QuantBackend::sync(&device).unwrap();
+            QuantBackend::seed(&device, seed);
+
+            // Create ONE input tensor with known seed
+            let tensor: Tensor<QuantBackend, 2> =
+                Tensor::random([256, 512], Distribution::Normal(0.0, 0.02), &device);
+
+            // Quantize TWICE using quantize_dynamic (re-computes q_params each time)
+            // but with the SAME seeded input tensor
+            let q1 = tensor.clone().quantize_dynamic(&scheme);
+            let q2 = tensor.quantize_dynamic(&scheme);
+            QuantBackend::sync(&device).unwrap();
+
+            // Dequantize both
+            let deq1: Tensor<QuantBackend, 2> = q1.dequantize();
+            let deq2: Tensor<QuantBackend, 2> = q2.dequantize();
+            QuantBackend::sync(&device).unwrap();
+
+            let sum1: f32 = deq1.clone().sum().into_scalar().elem();
+            let sum2: f32 = deq2.clone().sum().into_scalar().elem();
+
+            match (sum1.is_finite(), sum2.is_finite()) {
+                (true, true) => both_clean += 1,
+                (false, false) => {
+                    both_nan += 1;
+                    let nan1 = deq1
+                        .into_data()
+                        .iter::<f32>()
+                        .filter(|v| !v.is_finite())
+                        .count();
+                    let nan2 = deq2
+                        .into_data()
+                        .iter::<f32>()
+                        .filter(|v| !v.is_finite())
+                        .count();
+                    if nan1 == nan2 {
+                        both_nan_identical += 1;
+                    }
+                    if run < 5 {
+                        eprintln!(
+                            "[double-quant] run {run}: BOTH NaN — nan1={nan1}, nan2={nan2}, {}",
+                            if nan1 == nan2 { "IDENTICAL" } else { "DIFFER" }
+                        );
+                    }
+                }
+                (false, true) => {
+                    first_only += 1;
+                    if run < 5 {
+                        eprintln!(
+                            "[double-quant] run {run}: FIRST only NaN — allocation-dependent!"
+                        );
+                    }
+                }
+                (true, false) => {
+                    second_only += 1;
+                    if run < 5 {
+                        eprintln!(
+                            "[double-quant] run {run}: SECOND only NaN — allocation-dependent!"
+                        );
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "\n[double-quant] clean={both_clean}, both_nan={both_nan} \
+             (identical={both_nan_identical}), first_only={first_only}, second_only={second_only} \
+             / {total_runs} total"
+        );
+
+        // === Phase 2: Quantize→dequantize with fresh seed each run (baseline) ===
+        eprintln!("\n=== Phase 2: Baseline quantize_dynamic sweep ===\n");
+
+        let mut baseline_clean = 0usize;
+        for _ in 0..total_runs {
+            QuantBackend::sync(&device).unwrap();
+            QuantBackend::seed(&device, seed);
+
+            let tensor: Tensor<QuantBackend, 2> =
+                Tensor::random([256, 512], Distribution::Normal(0.0, 0.02), &device);
+            let quantized = tensor.quantize_dynamic(&scheme);
+            let dequantized: Tensor<QuantBackend, 2> = quantized.dequantize();
+            let deq_sum: f32 = dequantized.sum().into_scalar().elem();
+            if deq_sum.is_finite() {
+                baseline_clean += 1;
+            }
+        }
+
+        eprintln!(
+            "[baseline] {baseline_clean}/{total_runs} clean ({:.1}% fail)",
+            (total_runs - baseline_clean) as f64 / total_runs as f64 * 100.0
+        );
+
+        // === Summary ===
+        eprintln!("\n=== SUMMARY ===");
+        if first_only > 0 || second_only > 0 {
+            eprintln!(
+                "[diag] ASYMMETRIC failures (first_only={first_only}, second_only={second_only}) → \
+                 the quantize OUTPUT is allocation-dependent. Different GPU buffer pool states \
+                 produce different results. The bug is in how the output buffer interacts with \
+                 the quantize kernel's write path (likely stale padding data or ScalesView \
+                 addressing issue with Optimized layout)."
+            );
+        } else if both_nan > 0 && both_nan_identical == both_nan {
+            eprintln!(
+                "[diag] SYMMETRIC + IDENTICAL failures (both_nan={both_nan}, all identical) → \
+                 the quantize computation itself is deterministic given same input+qparams, \
+                 but the NaN is triggered by specific input data patterns. Check if the INPUT \
+                 scale/bias tensors are being corrupted by the output allocation."
+            );
+        } else if both_nan > 0 && both_nan_identical < both_nan {
+            eprintln!(
+                "[diag] SYMMETRIC but DIFFERENT NaN counts → the quantize kernel has \
+                 non-deterministic output even with identical inputs. This indicates a GPU \
+                 computation bug (race condition in the kernel, or reading from uninitialized memory)."
+            );
+        } else {
+            eprintln!(
+                "[diag] ALL CLEAN in double-quantize test → the bug only manifests with \
+                 quantize_dynamic (which re-computes q_params each time). The issue may be \
+                 in the q_params computation path interacting with the buffer pool."
+            );
         }
     }
 }

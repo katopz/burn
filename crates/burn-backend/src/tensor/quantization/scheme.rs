@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 pub use burn_std::{QPARAM_ALIGN, params_shape};
 use burn_std::{QuantLevel, QuantMode, QuantScheme, Shape};
 

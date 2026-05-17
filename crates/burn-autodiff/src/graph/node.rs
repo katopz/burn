@@ -61,7 +61,10 @@ impl Node {
 }
 
 /// Unique identifier generated for each node.
+/// Uses `#[repr(transparent)]` to guarantee identical layout to `u64`,
+/// enabling future SIMD/hash optimizations.
 #[derive(Clone, Hash, PartialEq, Eq, Debug, Copy)]
+#[repr(transparent)]
 pub struct NodeId {
     /// The integer representation of the id
     pub value: u64,

@@ -12,9 +12,6 @@ pub struct BreadthFirstSearch;
 pub trait TraversalItem {
     fn id(&self) -> NodeId;
     fn parents(&self) -> &[Parent];
-    fn parent_nodes(&self) -> Vec<NodeId> {
-        self.parents().iter().map(|p| p.id).collect()
-    }
 }
 
 impl BreadthFirstSearch {
@@ -33,7 +30,10 @@ impl BreadthFirstSearch {
         let mut parents = Vec::new();
 
         visited.insert(root_id);
-        parents.append(&mut root_step.parent_nodes());
+        // Push parent node IDs directly from the slice to avoid per-node Vec allocation
+        for p in root_step.parents() {
+            parents.push(p.id);
+        }
 
         callback(root_id, root_step);
 
@@ -44,7 +44,6 @@ impl BreadthFirstSearch {
             };
 
             let step_node = step.id();
-            let step_parents = step.parent_nodes();
 
             if visited.contains(&step_node) {
                 continue;
@@ -52,9 +51,10 @@ impl BreadthFirstSearch {
 
             visited.insert(step_node);
 
-            for id in step_parents.iter() {
-                if !visited.contains(id) {
-                    parents.push(*id);
+            // Iterate parent slice directly instead of collecting into Vec
+            for p in step.parents() {
+                if !visited.contains(&p.id) {
+                    parents.push(p.id);
                 }
             }
 

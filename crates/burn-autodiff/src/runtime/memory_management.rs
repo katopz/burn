@@ -61,8 +61,8 @@ impl GraphMemoryManagement {
         // When consuming nodes with a backward pass, some other backward passes become
         // unavailable because some of their parents have been consumed. They are
         // identified here.
-        for leaf in leaves.clone() {
-            self.unavailable_propagation(leaf);
+        for leaf in &leaves {
+            self.unavailable_propagation(*leaf);
         }
 
         // Among the available nodes that remain, some may be useless if no

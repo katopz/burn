@@ -69,31 +69,56 @@ pub(crate) fn matmul<E: NdArrayElement>(
     NdArrayOps::reshape(out, out_shape)
 }
 
+/// Maximum number of stride dimensions (batch dims = ndims - 2).
+/// Supports up to 8D tensors (6 batch dimensions).
+const MAX_STRIDE_DIMS: usize = 6;
+
 #[derive(Debug, PartialEq)]
 struct Strides {
-    strides: Vec<usize>,
+    strides: [usize; MAX_STRIDE_DIMS],
+    len: usize,
 }
+
 impl Strides {
     fn new(strides: Vec<usize>) -> Self {
-        Strides { strides }
+        let len = strides.len();
+        assert!(len <= MAX_STRIDE_DIMS, "Too many stride dimensions");
+        let mut arr = [0; MAX_STRIDE_DIMS];
+        arr[..len].copy_from_slice(&strides);
+        Strides { strides: arr, len }
     }
 
-    fn unflatten(&self, linear_index: usize) -> Vec<usize> {
-        let mut coord = Vec::with_capacity(self.strides.len());
+    #[cfg(test)]
+    fn empty() -> Self {
+        Strides {
+            strides: [0; MAX_STRIDE_DIMS],
+            len: 0,
+        }
+    }
+
+    /// Unflatten a linear batch index into a multi-dimensional coordinate.
+    /// Returns a fixed-size array to avoid per-batch heap allocation in the matmul hot loop.
+    fn unflatten(&self, linear_index: usize) -> [usize; MAX_STRIDE_DIMS] {
+        let mut coord = [0usize; MAX_STRIDE_DIMS];
         let mut rem = linear_index;
-        for stride in self.strides.iter() {
-            coord.push(rem / stride);
+        for (i, stride) in self.strides[..self.len].iter().enumerate() {
+            coord[i] = rem / stride;
             rem %= stride;
         }
         coord
     }
 
-    fn flatten(&self, index: &Vec<usize>) -> usize {
-        assert_eq!(self.strides.len(), index.len());
-        self.strides
+    /// Flatten a multi-dimensional coordinate back to a linear batch index.
+    /// Only reads `self.len` elements from the index slice.
+    fn flatten(&self, index: &[usize]) -> usize {
+        debug_assert!(
+            index.len() >= self.len,
+            "Index slice too short for stride flatten"
+        );
+        self.strides[..self.len]
             .iter()
-            .zip(index)
-            .map(|(stride, index)| stride * index)
+            .zip(&index[..self.len])
+            .map(|(stride, idx)| stride * idx)
             .sum()
     }
 }
@@ -234,18 +259,24 @@ pub(crate) fn cross<E: NdArrayElement>(
     let lhs_reshaped = NdArrayOps::reshape(lhs_permuted, Shape::new([batch_size, 3]));
     let rhs_reshaped = NdArrayOps::reshape(rhs_permuted, Shape::new([batch_size, 3]));
 
-    // Compute cross product
+    // Compute cross product using contiguous slice access to avoid
+    // per-element IxDyn allocation in the hot loop.
     let mut result = ndarray::ArrayD::<E>::zeros(IxDyn(&[batch_size, 3]));
+    let lhs_slice = lhs_reshaped.as_slice().unwrap();
+    let rhs_slice = rhs_reshaped.as_slice().unwrap();
+    let result_slice = result.as_slice_mut().unwrap();
+
     for i in 0..batch_size {
-        let a1 = lhs_reshaped[IxDyn(&[i, 0])];
-        let a2 = lhs_reshaped[IxDyn(&[i, 1])];
-        let a3 = lhs_reshaped[IxDyn(&[i, 2])];
-        let b1 = rhs_reshaped[IxDyn(&[i, 0])];
-        let b2 = rhs_reshaped[IxDyn(&[i, 1])];
-        let b3 = rhs_reshaped[IxDyn(&[i, 2])];
-        result[IxDyn(&[i, 0])] = a2.mul(b3).sub(a3.mul(b2));
-        result[IxDyn(&[i, 1])] = a3.mul(b1).sub(a1.mul(b3));
-        result[IxDyn(&[i, 2])] = a1.mul(b2).sub(a2.mul(b1));
+        let base = i * 3;
+        let a1 = lhs_slice[base];
+        let a2 = lhs_slice[base + 1];
+        let a3 = lhs_slice[base + 2];
+        let b1 = rhs_slice[base];
+        let b2 = rhs_slice[base + 1];
+        let b3 = rhs_slice[base + 2];
+        result_slice[base] = a2.mul(b3).sub(a3.mul(b2));
+        result_slice[base + 1] = a3.mul(b1).sub(a1.mul(b3));
+        result_slice[base + 2] = a1.mul(b2).sub(a2.mul(b1));
     }
 
     let result_shared = result.into_shared();
@@ -267,14 +298,6 @@ pub(crate) fn cross<E: NdArrayElement>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    impl Strides {
-        fn empty() -> Self {
-            Strides {
-                strides: Vec::with_capacity(0),
-            }
-        }
-    }
 
     #[test]
     fn test_output_shape() {

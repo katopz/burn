@@ -29,11 +29,14 @@ impl QuantizationStrategy {
                     num_blocks,
                     "Invalid per-block quantization with num blocks {num_blocks} and {numel} values"
                 );
-                values
-                    .chunks(block_elems)
-                    .enumerate()
-                    .flat_map(|(block_id, block)| strategy[block_id].quantize(block))
-                    .collect()
+                let mut result = Vec::with_capacity(numel);
+                for (block_id, block) in values.chunks(block_elems).enumerate() {
+                    let s = &strategy[block_id];
+                    for &value in block {
+                        result.push(s.quantize_one(value));
+                    }
+                }
+                result
             }
         }
     }
@@ -51,11 +54,14 @@ impl QuantizationStrategy {
                     num_blocks,
                     "Invalid per-block quantization with block size {block_elems}, num blocks {num_blocks} and {numel} values"
                 );
-                values
-                    .chunks(block_elems)
-                    .enumerate()
-                    .flat_map(|(block_id, block)| strategy[block_id].dequantize(block))
-                    .collect()
+                let mut result = Vec::with_capacity(numel);
+                for (block_id, block) in values.chunks(block_elems).enumerate() {
+                    let s = &strategy[block_id];
+                    for &value_q in block {
+                        result.push(s.dequantize_one(value_q));
+                    }
+                }
+                result
             }
         }
     }

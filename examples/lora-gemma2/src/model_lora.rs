@@ -863,7 +863,9 @@ pub struct Gemma2ForSFT<B: Backend> {
     /// Pad token ID to ignore in cross-entropy loss.
     pub pad_token_id: usize,
     /// If true, use fused CE kernel with inline softcapping instead of standard CE.
-    /// Default: false (standard CE is faster; fused CE saves memory but is slower).
+    /// Recommended for f16 Metal: avoids 256K log_probs materialization (~4GB saved),
+    /// f32 upcast in fused kernel prevents NaN from f16 logsumexp overflow.
+    /// Standard CE is ~20% faster but materializes [N, 256K] log_probs in f32 (~8GB).
     pub use_fused_ce: bool,
 }
 
@@ -925,7 +927,9 @@ fn mask_normalize_ce<B: Backend>(
     let [batch_size, seq_len] = token_losses.dims();
     let device = token_losses.device();
     let original_dtype = token_losses.dtype();
+
     let masked_ce = token_losses.mask_fill(mask_pad.clone(), 0);
+
     // Upcast sum accumulation to f32 for precision (same pattern as rms_norm_f32).
     // Both operands cast to f32 before sum+division avoids DTypeMismatch in autodiff.
     let masked_ce_sum = masked_ce.cast(FloatDType::F32).sum();
@@ -933,19 +937,21 @@ fn mask_normalize_ce<B: Backend>(
         .mask_fill(mask_pad, 0)
         .cast(FloatDType::F32)
         .sum();
+
     (masked_ce_sum / ntokens).cast(original_dtype)
 }
 
 /// TrainStep for cubecl GPU backends (metal, wgpu, cuda, vulkan, rocm).
 ///
 /// Supports two CE paths selected at runtime via `use_fused_ce`:
-/// - `false` (default): Standard CE (log_softmax → gather → neg).
-///   Faster (~0.20s/iter) — burn's `log_softmax` handles f16 numerical stability.
-///   Materializes `[batch*seq, 256K]` log_probs (~4GB for seq=2048).
-/// - `true`: Fused CE with inline softcapping (single GPU kernel).
+/// - `true` (recommended for f16): Fused CE with inline softcapping (single GPU kernel).
 ///   Avoids materializing `[batch*seq, 256K]` log_probs (~4GB memory saved).
-///   Slower (~0.25s/iter) — f32 upcast in fused kernel adds overhead.
-///   Use when memory-constrained, not for speed.
+///   f32 upcast in fused kernel prevents NaN from f16 logsumexp overflow.
+///   ~20% slower than standard CE but numerically safer for f16.
+/// - `false`: Standard CE (log_softmax → gather → neg).
+///   Faster (~0.20s/iter) — materializes `[batch*seq, 256K]` log_probs in f32.
+///   Logits are upcast to f32 before log_softmax to prevent 256K-vocab overflow.
+///   Memory-intensive: ~8GB for seq=2048 with 256K vocab.
 ///
 /// NOTE: Requires `B: FusedCEBackend` — the caller's `run()` function must
 /// propagate this bound. See `sft-train.rs` for the matching cfg-conditional bounds.
@@ -1006,7 +1012,10 @@ where
 
             let logits_f32 = logits.clone().cast(FloatDType::F32);
             let target_indices = targets.clone().reshape([batch_size, seq_len, 1]);
-            let token_losses = log_softmax(logits_f32, 2)
+
+            let log_probs = log_softmax(logits_f32, 2);
+
+            let token_losses = log_probs
                 .gather(2, target_indices)
                 .reshape([batch_size, seq_len])
                 .neg();
@@ -1067,19 +1076,19 @@ impl<B: Backend> InferenceStep for Gemma2ForSFT<B> {
         let logits = self.model.forward(batch.tokens_inputs);
         let targets = batch.targets;
 
-        // Token-normalized cross-entropy (same formula as TrainStep)
+        // Token-normalized cross-entropy (same formula as TrainStep).
+        // Cast to f32 before log_softmax — f16 overflows with 256K vocab
+        // (exp(30) ≈ 1e13 >> f16 max 65504, causes inf→NaN cascade).
         let [batch_size, seq_len, _vocab_size] = logits.dims();
-        let log_probs = log_softmax(logits.clone(), 2);
+        let logits_f32 = logits.clone().cast(FloatDType::F32);
         let target_indices = targets.clone().reshape([batch_size, seq_len, 1]);
-        let token_log_probs = log_probs
+        let token_losses = log_softmax(logits_f32, 2)
             .gather(2, target_indices)
-            .reshape([batch_size, seq_len]);
+            .reshape([batch_size, seq_len])
+            .neg();
 
-        let masked_ce = token_log_probs.neg().mask_fill(batch.mask_pad.clone(), 0);
-        let ntokens = Tensor::<B, 2>::ones([batch_size, seq_len], &logits.device())
-            .mask_fill(batch.mask_pad, 0)
-            .sum();
-        let loss = masked_ce.sum() / ntokens;
+        // Reuse mask_normalize_ce for DRY — handles f32 upcast for sum/normalization.
+        let loss = mask_normalize_ce(token_losses, batch.mask_pad.clone());
 
         // Log val loss for monitoring
         let loss_val: f32 = loss.clone().into_scalar().elem();

@@ -63,6 +63,19 @@ fn rms_norm_f32<B: Backend, const D: usize>(norm: &RmsNorm<B>, x: Tensor<B, D>) 
     output_f32.cast(original_dtype)
 }
 
+/// Mixed-precision linear: cast input to f32 for numerically stable matmul,
+/// then cast result back to original dtype.
+///
+/// Prevents f16 overflow in large dot products where `sum(x_i * w_i)` exceeds
+/// f16 max (65504). For Gemma 2 2B: QKV projections have 2304-element dot products,
+/// MLP gate/up have 2304→9216, down has 9216→2304 — all overflow f16.
+fn linear_f32<B: Backend, const D: usize>(linear: &Linear<B>, x: Tensor<B, D>) -> Tensor<B, D> {
+    let original_dtype = x.dtype();
+    let x_f32 = x.cast(FloatDType::F32);
+    let out = linear.forward(x_f32);
+    out.cast(original_dtype)
+}
+
 // ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
@@ -176,10 +189,10 @@ impl<B: Backend> Gemma2Attention<B> {
         let [batch, seq, _hidden] = x.dims();
         let kv_groups = self.num_heads / self.num_kv_heads;
 
-        // Project Q, K, V
-        let q = self.q_proj.forward(x.clone());
-        let k = self.k_proj.forward(x.clone());
-        let v = self.v_proj.forward(x);
+        // Project Q, K, V in f32 — hidden_size=2304 dot products overflow f16 max (65504).
+        let q = linear_f32(&self.q_proj, x.clone());
+        let k = linear_f32(&self.k_proj, x.clone());
+        let v = linear_f32(&self.v_proj, x);
 
         // Reshape to multi-head: [batch, seq, heads, head_dim] -> [batch, heads, seq, head_dim]
         let q = q
@@ -247,8 +260,8 @@ impl<B: Backend> Gemma2Attention<B> {
             .swap_dims(1, 2)
             .reshape([batch, seq, self.num_heads * self.head_dim]);
 
-        // Output projection
-        self.o_proj.forward(output)
+        // Output projection in f32 (num_heads * head_dim = 2304 dot product).
+        linear_f32(&self.o_proj, output)
     }
 }
 
@@ -285,18 +298,18 @@ impl<B: Backend> Gemma2MLP<B> {
 
     /// Forward pass: `[batch, seq, hidden] -> [batch, seq, hidden]`.
     ///
-    /// Uses f32 upcast for GELU computation (x^3 and tanh lose precision in f16),
-    /// following the same cast→compute→cast-back pattern as `rms_norm_f32`.
+    /// All linear projections use `linear_f32` for f32 matmul to prevent overflow
+    /// in large dot products (2304→9216, 9216→2304). GELU also computed in f32.
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
         let original_dtype = x.dtype();
 
-        // Upcast to f32 for GELU: x^3 and tanh approximation lose precision in f16.
-        let gate = self.gate_proj.forward(x.clone()).cast(FloatDType::F32);
+        // linear_f32: f16→f32 matmul→f16, then f32 for GELU stability.
+        let gate = linear_f32(&self.gate_proj, x.clone()).cast(FloatDType::F32);
         let gate = gelu_approximate(gate);
-        let up = self.up_proj.forward(x).cast(FloatDType::F32);
+        let up = linear_f32(&self.up_proj, x).cast(FloatDType::F32);
 
-        // Multiply in f32, cast back to original dtype for down_proj
-        self.down_proj.forward(gate.mul(up).cast(original_dtype))
+        // Multiply in f32, down_proj via linear_f32 (9216-element dot product).
+        linear_f32(&self.down_proj, gate.mul(up).cast(original_dtype))
     }
 }
 

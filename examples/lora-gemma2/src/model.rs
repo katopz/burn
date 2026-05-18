@@ -17,6 +17,7 @@ use burn::nn::{
 };
 use burn::tensor::{
     FloatDType, Int, Tensor, activation::gelu_approximate, activation::softmax, backend::Backend,
+    cast::ToElement,
 };
 
 use crate::types::Gemma2Config;
@@ -60,6 +61,50 @@ fn rms_norm_f32<B: Backend, const D: usize>(norm: &RmsNorm<B>, x: Tensor<B, D>) 
     let output_f32 = normalized * gamma_f32;
     // Cast back to original dtype
     output_f32.cast(original_dtype)
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics
+// ---------------------------------------------------------------------------
+
+/// Diagnostic checkpoint after a sub-layer operation.
+///
+/// Captures NaN status and value range to identify where f16 overflow
+/// originates in the forward pass.
+#[derive(Debug, Clone)]
+pub struct LayerCheck {
+    /// Hierarchical name, e.g. "layer_05/attention".
+    pub name: String,
+    /// True if NaN detected in output tensor.
+    pub has_nan: bool,
+    /// Minimum value in output tensor.
+    pub min: f32,
+    /// Maximum value in output tensor.
+    pub max: f32,
+}
+
+impl core::fmt::Display for LayerCheck {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let status = if self.has_nan { "!! NaN" } else { "OK    " };
+        write!(
+            f,
+            "{status} {:>30}: [{:>12.4}, {:>12.4}]",
+            self.name, self.min, self.max
+        )
+    }
+}
+
+/// Check a tensor for NaN and value range.
+fn check_tensor<B: Backend, const D: usize>(tensor: &Tensor<B, D>, name: &str) -> LayerCheck {
+    let has_nan = tensor.clone().contains_nan().into_scalar().to_bool();
+    let min: f32 = tensor.clone().min().into_scalar().to_f32();
+    let max: f32 = tensor.clone().max().into_scalar().to_f32();
+    LayerCheck {
+        name: name.to_string(),
+        has_nan,
+        min,
+        max,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +351,48 @@ impl<B: Backend> Gemma2Block<B> {
             .forward(rms_norm_f32(&self.pre_feedforward_layernorm, h.clone()));
         h + rms_norm_f32(&self.post_feedforward_layernorm, r)
     }
+
+    /// Diagnostic forward pass that records NaN/value-range after each sub-operation.
+    ///
+    /// Breaks down the block's sandwich-norm architecture into individual steps,
+    /// checking each intermediate tensor. Appends results to `checks`.
+    pub fn forward_diagnostic(
+        &self,
+        x: Tensor<B, 3>,
+        mask: Option<Tensor<B, 2>>,
+        layer_idx: usize,
+        checks: &mut Vec<LayerCheck>,
+    ) -> Tensor<B, 3> {
+        let p = format!("layer_{layer_idx:02}");
+
+        // Attention branch: input_norm -> attn -> post_attn_norm -> residual
+        let normed = rms_norm_f32(&self.input_layernorm, x.clone());
+        checks.push(check_tensor(&normed, &format!("{p}/input_norm")));
+
+        let attn_out = self.self_attn.forward(normed, mask);
+        checks.push(check_tensor(&attn_out, &format!("{p}/attention")));
+
+        let post_attn = rms_norm_f32(&self.post_attention_layernorm, attn_out);
+        checks.push(check_tensor(&post_attn, &format!("{p}/post_attn_norm")));
+
+        let h = x.clone() + post_attn;
+        checks.push(check_tensor(&h, &format!("{p}/attn_residual")));
+
+        // MLP branch: pre_ff_norm -> mlp -> post_ff_norm -> residual
+        let pre_ff = rms_norm_f32(&self.pre_feedforward_layernorm, h.clone());
+        checks.push(check_tensor(&pre_ff, &format!("{p}/pre_ff_norm")));
+
+        let mlp_out = self.mlp.forward(pre_ff);
+        checks.push(check_tensor(&mlp_out, &format!("{p}/mlp")));
+
+        let post_ff = rms_norm_f32(&self.post_feedforward_layernorm, mlp_out);
+        checks.push(check_tensor(&post_ff, &format!("{p}/post_ff_norm")));
+
+        let out = h + post_ff;
+        checks.push(check_tensor(&out, &format!("{p}/output")));
+
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +511,57 @@ impl<B: Backend> Gemma2Model<B> {
             .tanh()
             .mul_scalar(self.final_logit_softcapping)
             .cast(original_dtype)
+    }
+
+    /// Diagnostic forward pass that records NaN/value-range after every sub-layer.
+    ///
+    /// Returns the logits and a list of checkpoints showing where NaN/overflow
+    /// first appears. Use this to diagnose f16 precision issues layer by layer.
+    ///
+    /// Each checkpoint captures the tensor name, NaN status, and [min, max] range.
+    /// Checkpoints appear in execution order:
+    /// `embedding → layer_00/{input_norm, attention, ..., output} → ... → final_norm → lm_head → softcap`
+    pub fn forward_diagnostic(
+        &self,
+        input_ids: Tensor<B, 2, Int>,
+    ) -> (Tensor<B, 3>, Vec<LayerCheck>) {
+        let mut checks = Vec::new();
+        let device = input_ids.device();
+        let [_batch, seq_len] = input_ids.dims();
+
+        // Embedding: h = embed(tokens) * sqrt(hidden_size)
+        let scale = (self.hidden_size as f64).sqrt();
+        let h = self.embed.forward(input_ids).mul_scalar(scale);
+        checks.push(check_tensor(&h, "embedding"));
+
+        // Causal mask
+        let mask = causal_mask::<B>(seq_len, &device);
+
+        // Transformer blocks — each block appends ~8 checkpoints
+        let mut h = h;
+        for (i, layer) in self.layers.iter().enumerate() {
+            h = layer.forward_diagnostic(h, Some(mask.clone()), i, &mut checks);
+        }
+
+        // Final norm
+        let h = rms_norm_f32(&self.norm, h);
+        checks.push(check_tensor(&h, "final_norm"));
+
+        // LM head: [batch, seq, hidden] -> [batch, seq, vocab]
+        let logits = self.lm_head.forward(h);
+        checks.push(check_tensor(&logits, "lm_head"));
+
+        // Final logit softcapping in f32: tanh(logits / cap) * cap
+        let original_dtype = logits.dtype();
+        let capped = logits
+            .cast(FloatDType::F32)
+            .div_scalar(self.final_logit_softcapping)
+            .tanh()
+            .mul_scalar(self.final_logit_softcapping)
+            .cast(original_dtype);
+        checks.push(check_tensor(&capped, "softcap"));
+
+        (capped, checks)
     }
 }
 

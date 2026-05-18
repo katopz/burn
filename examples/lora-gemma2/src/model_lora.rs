@@ -994,6 +994,31 @@ fn mask_normalize_ce<B: Backend>(
     (masked_ce_sum / ntokens).cast(original_dtype)
 }
 
+/// Same as `mask_normalize_ce` but keeps the result in f32.
+///
+/// Critical for f16 training: calling `loss.backward()` on an f32 loss
+/// keeps the entire backward chain in f32, preventing gradient overflow
+/// when propagating through 26 transformer layers. The weight gradients
+/// are cast to f16 only at the final cast operation in `linear_f32`,
+/// and Adam's `mixed_precision` mode casts them back to f32 for the update.
+fn mask_normalize_ce_f32<B: Backend>(
+    token_losses: Tensor<B, 2>,
+    mask_pad: Tensor<B, 2, burn::tensor::Bool>,
+) -> Tensor<B, 1> {
+    let [batch_size, seq_len] = token_losses.dims();
+    let device = token_losses.device();
+
+    let masked_ce = token_losses.mask_fill(mask_pad.clone(), 0);
+
+    let masked_ce_sum = masked_ce.cast(FloatDType::F32).sum();
+    let ntokens = Tensor::<B, 2>::ones([batch_size, seq_len], &device)
+        .mask_fill(mask_pad, 0)
+        .cast(FloatDType::F32)
+        .sum();
+
+    masked_ce_sum / ntokens
+}
+
 /// TrainStep for cubecl GPU backends (metal, wgpu, cuda, vulkan, rocm).
 ///
 /// Supports two CE paths selected at runtime via `use_fused_ce`:
@@ -1046,7 +1071,8 @@ where
                 crate::fused_ops::fused_ce_loss::<B>(logits_flat, targets_flat, softcap)
                     .reshape([batch_size, seq_len]);
 
-            let loss = mask_normalize_ce(token_losses, mask_pad);
+            // Keep loss in f32 for backward — prevents gradient overflow through 26 layers.
+            let loss = mask_normalize_ce_f32(token_losses, mask_pad);
 
             // NOTE: Do NOT call loss.into_scalar() — GPU sync costs ~800ms/iter.
             TrainOutput::new(
@@ -1073,7 +1099,8 @@ where
                 .reshape([batch_size, seq_len])
                 .neg();
 
-            let loss = mask_normalize_ce(token_losses, mask_pad);
+            // Keep loss in f32 for backward — prevents gradient overflow through 26 layers.
+            let loss = mask_normalize_ce_f32(token_losses, mask_pad);
 
             TrainOutput::new(
                 self,
@@ -1111,7 +1138,8 @@ impl<B: AutodiffBackend> TrainStep for Gemma2ForSFT<B> {
             .reshape([batch_size, seq_len])
             .neg();
 
-        let loss = mask_normalize_ce(token_losses, batch.mask_pad.clone());
+        // Keep loss in f32 for backward — prevents gradient overflow through 26 layers.
+        let loss = mask_normalize_ce_f32(token_losses, batch.mask_pad.clone());
 
         TrainOutput::new(
             self,

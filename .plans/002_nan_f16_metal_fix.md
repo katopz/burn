@@ -24,15 +24,20 @@ f16 Gemma 2 2B training on Metal produces NaN from step 1 in the **forward pass*
 - `a1d8dc6de` fix(lora-gemma2): f32 upcast before log_softmax to prevent f16 overflow
 - `267bf97bf` refactor(lora-gemma2): remove BalancedCheckpointing, clarify f16 NaN test config
 - `71fe61d05` test(lora-gemma2): add NaN diagnostic test comparing f16 vs f32 Metal
+- `a1603b481` feat(lora-gemma2): add per-layer NaN diagnostic for forward pass
+- `54fa46472` fix(lora-gemma2): add linear_f32 mixed-precision for all projections
+- `182cedb23` fix(lora-gemma2): use linear_f32 for LM head (2304→256000 matmul)
+- `7e4a3eb72` fix(lora-gemma2): cast all operands to f32 in mixed-precision linear
 
 ## Tasks
 
 - [x] 1. Implement NaN detection wrapper — instrument forward pass to check NaN after each transformer layer ✅ `a1603b4`
-- [ ] 2. Run NaN detection on f16 Metal to identify exact overflow layer and operation *(needs user to run with data)*
+- [ ] 2. Run NaN detection on f16 Metal to validate forward fix and check backward *(needs user to run with data)*
 - [x] 3. Evaluate flex32 backend — ❌ NOT supported on Metal/wgpu (only CUDA+CPU). BF16 also not supported on Metal. ✅ `a1603b4`
 - [ ] 4. ~~If flex32 works: benchmark~~ — SKIP, flex32 not available on Metal
-- [ ] 5. Implement selective f32 upcast at overflow-prone layers (hybrid approach — only viable option for Metal)
-- [ ] 6. Document findings and update README with recommended dtype for Metal training
+- [x] 5. Implement selective f32 upcast at overflow-prone layers ✅ `7e4a3eb7` (forward pass fixed, stable loss=12.45)
+- [ ] 6. Fix backward pass f16 gradient overflow — NaN appears after gradient updates despite stable forward pass
+- [ ] 7. Document findings and update README with recommended dtype for Metal training
 
 ## Technical Approach
 
@@ -72,13 +77,14 @@ This will be a separate binary `test-nan-per-layer.rs` that can run with both f1
 - Verified in `burn-wgpu/src/lib.rs` tests (line 141)
 - ❌ Cannot use this path
 
-**Option B: Selective f32 upcast (hybrid) — CHOSEN PATH**
+**Option B: Selective f32 upcast (hybrid) — IMPLEMENTED ✅**
 - Only viable option for Metal (no flex32, no bf16)
-- Cast to f32 only for operations that overflow (identified by running test-nan-per-layer)
-- Pattern: `tensor.cast(F32) → op → result.cast(F16)`
-- Most likely candidates: QKV projection, MLP gate/up projection (hidden_size=2304 → large dot products)
-- Trade-off: slightly slower than pure f16 but much more stable
-- Memory: still f16 for weights/storage, f32 only transient during compute
+- Cast ALL operands (input, weight, bias, LoRA A/B) to f32 before matmul
+- Pattern: `linear_f32()` / `lora_linear_f32()` — cast weight+bias to f32, compute, cast result back
+- Applied to: QKV projections, output projection, MLP gate/up/down, LM head
+- Forward pass now produces stable loss (12.45) for multiple steps
+- **Remaining issue**: backward pass f16 gradient overflow — NaN appears after gradient updates
+- Memory: weights remain f16 in storage, f32 only transient during compute
 
 **~~Option C: BF16~~ — NOT AVAILABLE ON METAL**
 - BF16 has same range as f32 (8 exponent bits) but lower precision (7 mantissa bits)
@@ -119,9 +125,31 @@ Run full training for 50+ steps with the fix:
 
 Source: `burn-wgpu/src/lib.rs` `should_support_dtypes` test
 
+## Current Status (2026-05-18)
+
+### Forward Pass — FIXED ✅
+- All linear projections (QKV, output, gate, up, down, LM head) now use f32 matmul
+- Forward pass produces stable loss (12.45) across multiple batches
+- `linear_f32` and `lora_linear_f32` cast ALL operands to f32 (input, weight, bias, LoRA A/B)
+- Previous approach of only casting input produced garbage (loss=0.0) due to burn's dtype reinterpretation
+
+### Backward Pass — REMAINING ISSUE ❌
+- NaN appears after gradient updates despite stable forward pass
+- f16 gradients overflow during backward matmul (same dot product issue as forward)
+- Possible fixes:
+  1. Dynamic loss scaling (scale loss up before backward, scale gradients down after)
+  2. Gradient clipping at a smaller threshold (tried 0.1, still NaN)
+  3. Full f32 training (stable but ~5x slower, ~2x memory)
+  4. Upstream fix: cubecl/cubek f32 accumulation mode for f16 matmul backward
+
+### Next Steps
+1. Run `test-nan-per-layer --dtype f16` to validate forward fix is clean
+2. Try dynamic loss scaling (e.g., `loss * 1024` → backward → `grads / 1024`)
+3. If loss scaling fails, fall back to f32 training (already works: ~22s/iter, stable convergence)
+
 ## Notes
 
 - The stash in cubek repo (quantize buffer pool fix) is independent and can be applied separately
 - The test-nan-f16-vs-f32.rs binary is already committed and can be used for validation
-- If the root cause is in burn's wgpu/Metal kernel implementations (not the model), this may require upstream fixes to burn or cubek
-- **Next step**: User must run `test-nan-per-layer --dtype f16` to identify exact overflow layer, then we implement selective f32 upcast at that layer
+- The test-nan-per-layer binary can pinpoint any remaining forward pass issues
+- burn's matmul dispatch reinterprets rhs bytes as lhs dtype — mixed dtypes in same matmul produce garbage

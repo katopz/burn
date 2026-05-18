@@ -59,6 +59,57 @@ use crate::model::{Gemma2Attention, Gemma2Block, Gemma2MLP, Gemma2Model};
 use crate::types::LoraTarget;
 
 // ---------------------------------------------------------------------------
+// f32 mixed-precision helpers for f16 training stability
+// ---------------------------------------------------------------------------
+// Burn's matmul dispatch reinterprets rhs bytes as lhs dtype, so mismatched
+// dtypes (f32 input × f16 weight) produce garbage. These helpers cast ALL
+// operands (input, weight, LoRA A/B) to f32 before matmul to prevent both
+// overflow and dtype mismatch issues.
+
+/// Mixed-precision plain linear: cast input, weight, and bias to f32.
+/// Used for `lm_head` (Linear, not LoRA-adapted).
+///
+/// Casts output back to original dtype to avoid DTypeMismatch in downstream
+/// operations (residual connections expect uniform dtype).
+fn linear_f32<B: Backend, const D: usize>(linear: &Linear<B>, x: Tensor<B, D>) -> Tensor<B, D> {
+    let original_dtype = x.dtype();
+    let x_f32 = x.cast(FloatDType::F32);
+    let w_f32 = linear.weight.val().cast(FloatDType::F32);
+    let b_f32 = linear.bias.as_ref().map(|b| b.val().cast(FloatDType::F32));
+    burn::tensor::module::linear(x_f32, w_f32, b_f32).cast(original_dtype)
+}
+
+/// Mixed-precision LoRA linear: cast input, base weight, and LoRA A/B to f32.
+/// Computes base(x) + x @ A @ B * scaling entirely in f32, then casts back.
+///
+/// Skips dropout (LoRA dropout is typically p=0). For non-zero dropout,
+/// the regularized signal is small relative to the base output.
+fn lora_linear_f32<B: Backend, const D: usize>(
+    lora: &LoraLinear<B>,
+    x: Tensor<B, D>,
+) -> Tensor<B, D> {
+    let original_dtype = x.dtype();
+    let x_f32 = x.cast(FloatDType::F32);
+
+    // Base path: cast weight to f32 for numerically stable matmul.
+    let w_f32 = lora.base.weight.val().cast(FloatDType::F32);
+    let b_f32 = lora
+        .base
+        .bias
+        .as_ref()
+        .map(|b| b.val().cast(FloatDType::F32));
+    let base_out = burn::tensor::module::linear(x_f32.clone(), w_f32, b_f32);
+
+    // LoRA path: cast A/B to f32 (same dtype mismatch issue as base weight).
+    let lora_a = lora.lora_a.val().cast(FloatDType::F32).unsqueeze::<D>();
+    let lora_b = lora.lora_b.val().cast(FloatDType::F32).unsqueeze::<D>();
+    let lora_out = x_f32.matmul(lora_a).matmul(lora_b).mul_scalar(lora.scaling);
+
+    // Cast back to original dtype — residual connections require uniform dtype.
+    (base_out + lora_out).cast(original_dtype)
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -124,10 +175,10 @@ impl<B: Backend> Gemma2AttentionLora<B> {
         let [batch, seq, _hidden] = x.dims();
         let kv_groups = self.num_heads / self.num_kv_heads;
 
-        // Project Q, K, V (LoRA forward: base(x) + x @ A @ B * scaling)
-        let q = self.q_proj.forward(x.clone());
-        let k = self.k_proj.forward(x.clone());
-        let v = self.v_proj.forward(x);
+        // Project Q, K, V in f32 — hidden_size=2304 dot products overflow f16 max (65504).
+        let q = lora_linear_f32(&self.q_proj, x.clone());
+        let k = lora_linear_f32(&self.k_proj, x.clone());
+        let v = lora_linear_f32(&self.v_proj, x);
 
         // Reshape to multi-head: [batch, seq, heads, head_dim] -> [batch, heads, seq, head_dim]
         let q = q
@@ -196,8 +247,8 @@ impl<B: Backend> Gemma2AttentionLora<B> {
             .swap_dims(1, 2)
             .reshape([batch, seq, self.num_heads * self.head_dim]);
 
-        // Output projection (LoRA)
-        self.o_proj.forward(output)
+        // Output projection in f32 (num_heads * head_dim = 2304 dot product).
+        lora_linear_f32(&self.o_proj, output)
     }
 }
 
@@ -223,13 +274,13 @@ impl<B: Backend> Gemma2MLPLora<B> {
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
         let original_dtype = x.dtype();
 
-        // Upcast to f32 for GELU: x^3 and tanh approximation lose precision in f16.
-        let gate = self.gate_proj.forward(x.clone()).cast(FloatDType::F32);
+        // All projections in f32 — 2304→9216 and 9216→2304 dot products overflow f16.
+        let gate = lora_linear_f32(&self.gate_proj, x.clone()).cast(FloatDType::F32);
         let gate = gelu_approximate(gate);
-        let up = self.up_proj.forward(x).cast(FloatDType::F32);
+        let up = lora_linear_f32(&self.up_proj, x).cast(FloatDType::F32);
 
-        // Multiply in f32, cast back to original dtype for down_proj
-        self.down_proj.forward(gate.mul(up).cast(original_dtype))
+        // down_proj in f32 (9216-element dot product).
+        lora_linear_f32(&self.down_proj, gate.mul(up).cast(original_dtype))
     }
 }
 
@@ -401,9 +452,9 @@ impl<B: Backend> Gemma2ModelLora<B> {
             h = layer.forward(h, Some(mask.clone()));
         }
 
-        // Final norm (mixed precision for stability) + LM head + softcapping
+        // Final norm + LM head in f32 (hidden_size=2304 dot product with 256K vocab).
         let h = rms_norm_f32(&self.norm, h);
-        let logits = self.lm_head.forward(h);
+        let logits = linear_f32(&self.lm_head, h);
 
         // Softcapping in f32 for numerical stability
         let original_dtype = logits.dtype();
@@ -436,8 +487,9 @@ impl<B: Backend> Gemma2ModelLora<B> {
             h = layer.forward(h, Some(mask.clone()));
         }
 
+        // LM head in f32: hidden_size=2304 dot product with 256K vocab overflows f16.
         let h = rms_norm_f32(&self.norm, h);
-        self.lm_head.forward(h)
+        linear_f32(&self.lm_head, h)
     }
 
     /// Forward pass with fused LoRA MLP kernels, returning raw logits without softcapping.
@@ -472,8 +524,9 @@ impl<B: Backend> Gemma2ModelLora<B> {
             h = layer.forward_fused(h, Some(mask.clone()));
         }
 
+        // LM head in f32: hidden_size=2304 dot product with 256K vocab overflows f16.
         let h = rms_norm_f32(&self.norm, h);
-        self.lm_head.forward(h)
+        linear_f32(&self.lm_head, h)
     }
 
     /// Merge all LoRA weights into base layers for inference.

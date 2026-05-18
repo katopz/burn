@@ -27,11 +27,11 @@ f16 Gemma 2 2B training on Metal produces NaN from step 1 in the **forward pass*
 
 ## Tasks
 
-- [ ] 1. Implement NaN detection wrapper — instrument forward pass to check NaN after each transformer layer
-- [ ] 2. Run NaN detection on f16 Metal to identify exact overflow layer and operation
-- [ ] 3. Evaluate flex32 backend — test if burn's flex32 (16-bit with f32 accumulation) resolves NaN
-- [ ] 4. If flex32 works: benchmark flex32 vs f16 vs f32 (throughput, memory, convergence)
-- [ ] 5. If flex32 doesn't work: implement selective f32 upcast at overflow-prone layers (hybrid approach)
+- [x] 1. Implement NaN detection wrapper — instrument forward pass to check NaN after each transformer layer ✅ `a1603b4`
+- [ ] 2. Run NaN detection on f16 Metal to identify exact overflow layer and operation *(needs user to run with data)*
+- [x] 3. Evaluate flex32 backend — ❌ NOT supported on Metal/wgpu (only CUDA+CPU). BF16 also not supported on Metal. ✅ `a1603b4`
+- [ ] 4. ~~If flex32 works: benchmark~~ — SKIP, flex32 not available on Metal
+- [ ] 5. Implement selective f32 upcast at overflow-prone layers (hybrid approach — only viable option for Metal)
 - [ ] 6. Document findings and update README with recommended dtype for Metal training
 
 ## Technical Approach
@@ -66,23 +66,24 @@ This will be a separate binary `test-nan-per-layer.rs` that can run with both f1
 
 ### Phase 2: Fix Evaluation (Tasks 3-5)
 
-**Option A: flex32 (preferred)**
+**~~Option A: flex32~~ — NOT AVAILABLE ON METAL**
 - burn's `flex32` is a 16-bit format with f32 accumulation
-- Gives f16-like memory savings with f32 numerical stability
-- Change: `type Backend = Metal<flex32, i64>` in sft-train.rs
-- If the Metal/wgpu backend supports flex32 matmul kernels, this should "just work"
+- Supported on CUDA and CPU only — `supports_dtype(DType::Flex32)` returns `false` for Metal
+- Verified in `burn-wgpu/src/lib.rs` tests (line 141)
+- ❌ Cannot use this path
 
-**Option B: Selective f32 upcast (hybrid)**
-- If flex32 has performance issues or isn't supported on Metal
-- Cast to f32 only for operations that overflow (identified in Phase 1)
+**Option B: Selective f32 upcast (hybrid) — CHOSEN PATH**
+- Only viable option for Metal (no flex32, no bf16)
+- Cast to f32 only for operations that overflow (identified by running test-nan-per-layer)
 - Pattern: `tensor.cast(F32) → op → result.cast(F16)`
-- Most likely candidates: QKV projection, MLP gate/up projection
+- Most likely candidates: QKV projection, MLP gate/up projection (hidden_size=2304 → large dot products)
 - Trade-off: slightly slower than pure f16 but much more stable
+- Memory: still f16 for weights/storage, f32 only transient during compute
 
-**Option C: BF16 (if available)**
+**~~Option C: BF16~~ — NOT AVAILABLE ON METAL**
 - BF16 has same range as f32 (8 exponent bits) but lower precision (7 mantissa bits)
-- Ideal for training — avoids overflow while keeping 16-bit memory
-- Depends on Metal/wgpu BF16 kernel support in burn
+- `supports_dtype(DType::BF16)` returns `false` for Metal
+- ❌ Cannot use this path
 
 ### Phase 3: Validation (Task 6)
 
@@ -94,8 +95,9 @@ Run full training for 50+ steps with the fix:
 
 ## Files to Modify
 
-- `examples/lora-gemma2/src/bin/test-nan-per-layer.rs` — NEW: per-layer NaN diagnostic binary
-- `examples/lora-gemma2/src/model.rs` — Add `forward_diagnostic()` method
+- `examples/lora-gemma2/src/bin/test-nan-per-layer.rs` — ✅ DONE: per-layer NaN diagnostic binary
+- `examples/lora-gemma2/src/model.rs` — ✅ DONE: `forward_diagnostic()` method + `LayerCheck` struct
+- `examples/lora-gemma2/src/model.rs` — NEXT: Add selective f32 upcast to overflow-prone ops
 - `examples/lora-gemma2/src/bin/sft-train.rs` — Update Backend type based on fix
 - `examples/lora-gemma2/src/model_lora.rs` — Any needed upcast changes
 
@@ -106,8 +108,20 @@ Run full training for 50+ steps with the fix:
 3. Throughput is at least 2x faster than f32 baseline
 4. Peak memory is at least 30% less than f32 baseline
 
+## dtype Support Matrix (Metal/wgpu)
+
+| dtype  | Metal | CUDA | CPU | Notes                          |
+|--------|-------|------|-----|--------------------------------|
+| f16    | ✅    | ✅   | ✅  | Overflows with large dot products |
+| f32    | ✅    | ✅   | ✅  | Stable but 2x memory, ~5x slower |
+| flex32 | ❌    | ✅   | ✅  | 16-bit storage + f32 compute     |
+| bf16   | ❌    | ✅   | ✅  | f32 range + 16-bit precision     |
+
+Source: `burn-wgpu/src/lib.rs` `should_support_dtypes` test
+
 ## Notes
 
 - The stash in cubek repo (quantize buffer pool fix) is independent and can be applied separately
 - The test-nan-f16-vs-f32.rs binary is already committed and can be used for validation
 - If the root cause is in burn's wgpu/Metal kernel implementations (not the model), this may require upstream fixes to burn or cubek
+- **Next step**: User must run `test-nan-per-layer --dtype f16` to identify exact overflow layer, then we implement selective f32 upcast at that layer

@@ -63,16 +63,21 @@ fn rms_norm_f32<B: Backend, const D: usize>(norm: &RmsNorm<B>, x: Tensor<B, D>) 
     output_f32.cast(original_dtype)
 }
 
-/// Mixed-precision linear: cast input to f32 for numerically stable matmul,
-/// then cast result back to original dtype.
+/// Mixed-precision linear: cast input, weight, and bias to f32 for numerically
+/// stable matmul, then cast result back to original dtype.
 ///
 /// Prevents f16 overflow in large dot products where `sum(x_i * w_i)` exceeds
 /// f16 max (65504). For Gemma 2 2B: QKV projections have 2304-element dot products,
 /// MLP gate/up have 2304→9216, down has 9216→2304 — all overflow f16.
+///
+/// NOTE: Must cast ALL operands to f32 — burn's matmul dispatch reinterprets rhs
+/// bytes as lhs dtype, so mismatched dtypes (f32 input × f16 weight) produce garbage.
 fn linear_f32<B: Backend, const D: usize>(linear: &Linear<B>, x: Tensor<B, D>) -> Tensor<B, D> {
     let original_dtype = x.dtype();
     let x_f32 = x.cast(FloatDType::F32);
-    let out = linear.forward(x_f32);
+    let w_f32 = linear.weight.val().cast(FloatDType::F32);
+    let b_f32 = linear.bias.as_ref().map(|b| b.val().cast(FloatDType::F32));
+    let out = burn::tensor::module::linear(x_f32, w_f32, b_f32);
     out.cast(original_dtype)
 }
 

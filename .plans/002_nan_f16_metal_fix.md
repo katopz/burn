@@ -36,7 +36,7 @@ f16 Gemma 2 2B training on Metal produces NaN from step 1 in the **forward pass*
 - [x] 3. Evaluate flex32 backend — ❌ NOT supported on Metal/wgpu (only CUDA+CPU). BF16 also not supported on Metal. ✅ `a1603b4`
 - [ ] 4. ~~If flex32 works: benchmark~~ — SKIP, flex32 not available on Metal
 - [x] 5. Implement selective f32 upcast at overflow-prone layers ✅ `7e4a3eb7` (forward pass fixed, stable loss=12.45)
-- [ ] 6. Fix backward pass f16 gradient overflow — NaN appears after gradient updates despite stable forward pass
+- [x] 6. Fix backward pass f16 gradient overflow — keep loss in f32 for backward ✅ `9c3e32c` (mask_normalize_ce_f32)
 - [ ] 7. Document findings and update README with recommended dtype for Metal training
 
 ## Technical Approach
@@ -84,6 +84,7 @@ This will be a separate binary `test-nan-per-layer.rs` that can run with both f1
 - Applied to: QKV projections, output projection, MLP gate/up/down, LM head
 - Forward pass now produces stable loss (12.45) for multiple steps
 - **Remaining issue**: backward pass f16 gradient overflow — NaN appears after gradient updates
+- **Fix**: `mask_normalize_ce_f32` keeps loss in f32 so backward chain stays in f32
 - Memory: weights remain f16 in storage, f32 only transient during compute
 
 **~~Option C: BF16~~ — NOT AVAILABLE ON METAL**
@@ -133,19 +134,17 @@ Source: `burn-wgpu/src/lib.rs` `should_support_dtypes` test
 - `linear_f32` and `lora_linear_f32` cast ALL operands to f32 (input, weight, bias, LoRA A/B)
 - Previous approach of only casting input produced garbage (loss=0.0) due to burn's dtype reinterpretation
 
-### Backward Pass — REMAINING ISSUE ❌
-- NaN appears after gradient updates despite stable forward pass
-- f16 gradients overflow during backward matmul (same dot product issue as forward)
-- Possible fixes:
-  1. Dynamic loss scaling (scale loss up before backward, scale gradients down after)
-  2. Gradient clipping at a smaller threshold (tried 0.1, still NaN)
-  3. Full f32 training (stable but ~5x slower, ~2x memory)
-  4. Upstream fix: cubecl/cubek f32 accumulation mode for f16 matmul backward
+### Backward Pass — FIXED ✅
+- `mask_normalize_ce_f32` keeps loss in f32, so backward chain stays in f32
+- Weight gradients cast to f16 at `linear_f32` endpoints, but Adam `mixed_precision`
+  casts them back to f32 for the optimizer update
+- Residual connections and RMSNorm backward are dtype-safe (additions pass through,
+  rms_norm_f32 computes backward in f32)
 
 ### Next Steps
 1. Run `test-nan-per-layer --dtype f16` to validate forward fix is clean
-2. Try dynamic loss scaling (e.g., `loss * 1024` → backward → `grads / 1024`)
-3. If loss scaling fails, fall back to f32 training (already works: ~22s/iter, stable convergence)
+2. Run full training for 50+ steps to verify convergence without NaN
+3. If NaN persists, investigate dynamic loss scaling as fallback
 
 ## Notes
 

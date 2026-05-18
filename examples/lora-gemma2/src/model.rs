@@ -63,24 +63,6 @@ fn rms_norm_f32<B: Backend, const D: usize>(norm: &RmsNorm<B>, x: Tensor<B, D>) 
     output_f32.cast(original_dtype)
 }
 
-/// Mixed-precision linear: cast input, weight, and bias to f32 for numerically
-/// stable matmul, then cast result back to original dtype.
-///
-/// Prevents f16 overflow in large dot products where `sum(x_i * w_i)` exceeds
-/// f16 max (65504). For Gemma 2 2B: QKV projections have 2304-element dot products,
-/// MLP gate/up have 2304→9216, down has 9216→2304 — all overflow f16.
-///
-/// NOTE: Must cast ALL operands to f32 — burn's matmul dispatch reinterprets rhs
-/// bytes as lhs dtype, so mismatched dtypes (f32 input × f16 weight) produce garbage.
-fn linear_f32<B: Backend, const D: usize>(linear: &Linear<B>, x: Tensor<B, D>) -> Tensor<B, D> {
-    let original_dtype = x.dtype();
-    let x_f32 = x.cast(FloatDType::F32);
-    let w_f32 = linear.weight.val().cast(FloatDType::F32);
-    let b_f32 = linear.bias.as_ref().map(|b| b.val().cast(FloatDType::F32));
-    let out = burn::tensor::module::linear(x_f32, w_f32, b_f32);
-    out.cast(original_dtype)
-}
-
 // ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
@@ -194,10 +176,10 @@ impl<B: Backend> Gemma2Attention<B> {
         let [batch, seq, _hidden] = x.dims();
         let kv_groups = self.num_heads / self.num_kv_heads;
 
-        // Project Q, K, V in f32 — hidden_size=2304 dot products overflow f16 max (65504).
-        let q = linear_f32(&self.q_proj, x.clone());
-        let k = linear_f32(&self.k_proj, x.clone());
-        let v = linear_f32(&self.v_proj, x);
+        // Project Q, K, V
+        let q = self.q_proj.forward(x.clone());
+        let k = self.k_proj.forward(x.clone());
+        let v = self.v_proj.forward(x);
 
         // Reshape to multi-head: [batch, seq, heads, head_dim] -> [batch, heads, seq, head_dim]
         let q = q
@@ -265,8 +247,8 @@ impl<B: Backend> Gemma2Attention<B> {
             .swap_dims(1, 2)
             .reshape([batch, seq, self.num_heads * self.head_dim]);
 
-        // Output projection in f32 (num_heads * head_dim = 2304 dot product).
-        linear_f32(&self.o_proj, output)
+        // Output projection
+        self.o_proj.forward(output)
     }
 }
 
@@ -303,18 +285,18 @@ impl<B: Backend> Gemma2MLP<B> {
 
     /// Forward pass: `[batch, seq, hidden] -> [batch, seq, hidden]`.
     ///
-    /// All linear projections use `linear_f32` for f32 matmul to prevent overflow
-    /// in large dot products (2304→9216, 9216→2304). GELU also computed in f32.
+    /// Uses f32 upcast for GELU computation (x^3 and tanh lose precision in f16),
+    /// following the same cast→compute→cast-back pattern as `rms_norm_f32`.
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
         let original_dtype = x.dtype();
 
-        // linear_f32: f16→f32 matmul→f16, then f32 for GELU stability.
-        let gate = linear_f32(&self.gate_proj, x.clone()).cast(FloatDType::F32);
+        // Upcast to f32 for GELU: x^3 and tanh approximation lose precision in f16.
+        let gate = self.gate_proj.forward(x.clone()).cast(FloatDType::F32);
         let gate = gelu_approximate(gate);
-        let up = linear_f32(&self.up_proj, x).cast(FloatDType::F32);
+        let up = self.up_proj.forward(x).cast(FloatDType::F32);
 
-        // Multiply in f32, down_proj via linear_f32 (9216-element dot product).
-        linear_f32(&self.down_proj, gate.mul(up).cast(original_dtype))
+        // Multiply in f32, cast back to original dtype for down_proj
+        self.down_proj.forward(gate.mul(up).cast(original_dtype))
     }
 }
 
@@ -482,8 +464,8 @@ impl<B: Backend> Gemma2Model<B> {
         // Final norm (mixed precision for stability)
         let h = rms_norm_f32(&self.norm, h);
 
-        // LM head in f32: hidden_size=2304 dot product with 256K vocab overflows f16.
-        let logits = linear_f32(&self.lm_head, h);
+        // LM head: [batch, seq, hidden] -> [batch, seq, vocab]
+        let logits = self.lm_head.forward(h);
 
         // Final logit softcapping in f32: tanh(logits / cap) * cap
         let original_dtype = logits.dtype();
@@ -520,8 +502,7 @@ impl<B: Backend> Gemma2Model<B> {
 
     /// Compute logits from hidden states (after LM head + softcapping in f32).
     pub fn hidden_to_logits(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
-        // LM head in f32: hidden_size=2304 dot product with 256K vocab overflows f16.
-        let logits = linear_f32(&self.lm_head, hidden);
+        let logits = self.lm_head.forward(hidden);
         // Softcapping in f32 for numerical stability
         let original_dtype = logits.dtype();
         logits
@@ -566,8 +547,8 @@ impl<B: Backend> Gemma2Model<B> {
         let h = rms_norm_f32(&self.norm, h);
         checks.push(check_tensor(&h, "final_norm"));
 
-        // LM head in f32: hidden_size=2304 dot product with 256K vocab overflows f16.
-        let logits = linear_f32(&self.lm_head, h);
+        // LM head: [batch, seq, hidden] -> [batch, seq, vocab]
+        let logits = self.lm_head.forward(h);
         checks.push(check_tensor(&logits, "lm_head"));
 
         // Final logit softcapping in f32: tanh(logits / cap) * cap

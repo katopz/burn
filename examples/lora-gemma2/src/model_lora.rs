@@ -59,57 +59,6 @@ use crate::model::{Gemma2Attention, Gemma2Block, Gemma2MLP, Gemma2Model};
 use crate::types::LoraTarget;
 
 // ---------------------------------------------------------------------------
-// f32 mixed-precision helpers for f16 training stability
-// ---------------------------------------------------------------------------
-// Burn's matmul dispatch reinterprets rhs bytes as lhs dtype, so mismatched
-// dtypes (f32 input × f16 weight) produce garbage. These helpers cast ALL
-// operands (input, weight, LoRA A/B) to f32 before matmul to prevent both
-// overflow and dtype mismatch issues.
-
-/// Mixed-precision plain linear: cast input, weight, and bias to f32.
-/// Used for `lm_head` (Linear, not LoRA-adapted).
-///
-/// Casts output back to original dtype to avoid DTypeMismatch in downstream
-/// operations (residual connections expect uniform dtype).
-fn linear_f32<B: Backend, const D: usize>(linear: &Linear<B>, x: Tensor<B, D>) -> Tensor<B, D> {
-    let original_dtype = x.dtype();
-    let x_f32 = x.cast(FloatDType::F32);
-    let w_f32 = linear.weight.val().cast(FloatDType::F32);
-    let b_f32 = linear.bias.as_ref().map(|b| b.val().cast(FloatDType::F32));
-    burn::tensor::module::linear(x_f32, w_f32, b_f32).cast(original_dtype)
-}
-
-/// Mixed-precision LoRA linear: cast input, base weight, and LoRA A/B to f32.
-/// Computes base(x) + x @ A @ B * scaling entirely in f32, then casts back.
-///
-/// Skips dropout (LoRA dropout is typically p=0). For non-zero dropout,
-/// the regularized signal is small relative to the base output.
-fn lora_linear_f32<B: Backend, const D: usize>(
-    lora: &LoraLinear<B>,
-    x: Tensor<B, D>,
-) -> Tensor<B, D> {
-    let original_dtype = x.dtype();
-    let x_f32 = x.cast(FloatDType::F32);
-
-    // Base path: cast weight to f32 for numerically stable matmul.
-    let w_f32 = lora.base.weight.val().cast(FloatDType::F32);
-    let b_f32 = lora
-        .base
-        .bias
-        .as_ref()
-        .map(|b| b.val().cast(FloatDType::F32));
-    let base_out = burn::tensor::module::linear(x_f32.clone(), w_f32, b_f32);
-
-    // LoRA path: cast A/B to f32 (same dtype mismatch issue as base weight).
-    let lora_a = lora.lora_a.val().cast(FloatDType::F32).unsqueeze::<D>();
-    let lora_b = lora.lora_b.val().cast(FloatDType::F32).unsqueeze::<D>();
-    let lora_out = x_f32.matmul(lora_a).matmul(lora_b).mul_scalar(lora.scaling);
-
-    // Cast back to original dtype — residual connections require uniform dtype.
-    (base_out + lora_out).cast(original_dtype)
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -175,10 +124,10 @@ impl<B: Backend> Gemma2AttentionLora<B> {
         let [batch, seq, _hidden] = x.dims();
         let kv_groups = self.num_heads / self.num_kv_heads;
 
-        // Project Q, K, V in f32 — hidden_size=2304 dot products overflow f16 max (65504).
-        let q = lora_linear_f32(&self.q_proj, x.clone());
-        let k = lora_linear_f32(&self.k_proj, x.clone());
-        let v = lora_linear_f32(&self.v_proj, x);
+        // Project Q, K, V (LoRA forward: base(x) + x @ A @ B * scaling)
+        let q = self.q_proj.forward(x.clone());
+        let k = self.k_proj.forward(x.clone());
+        let v = self.v_proj.forward(x);
 
         // Reshape to multi-head: [batch, seq, heads, head_dim] -> [batch, heads, seq, head_dim]
         let q = q
@@ -247,8 +196,8 @@ impl<B: Backend> Gemma2AttentionLora<B> {
             .swap_dims(1, 2)
             .reshape([batch, seq, self.num_heads * self.head_dim]);
 
-        // Output projection in f32 (num_heads * head_dim = 2304 dot product).
-        lora_linear_f32(&self.o_proj, output)
+        // Output projection (LoRA)
+        self.o_proj.forward(output)
     }
 }
 
@@ -274,13 +223,13 @@ impl<B: Backend> Gemma2MLPLora<B> {
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
         let original_dtype = x.dtype();
 
-        // All projections in f32 — 2304→9216 and 9216→2304 dot products overflow f16.
-        let gate = lora_linear_f32(&self.gate_proj, x.clone()).cast(FloatDType::F32);
+        // Upcast to f32 for GELU: x^3 and tanh approximation lose precision in f16.
+        let gate = self.gate_proj.forward(x.clone()).cast(FloatDType::F32);
         let gate = gelu_approximate(gate);
-        let up = lora_linear_f32(&self.up_proj, x).cast(FloatDType::F32);
+        let up = self.up_proj.forward(x).cast(FloatDType::F32);
 
-        // down_proj in f32 (9216-element dot product).
-        lora_linear_f32(&self.down_proj, gate.mul(up).cast(original_dtype))
+        // Multiply in f32, cast back to original dtype for down_proj
+        self.down_proj.forward(gate.mul(up).cast(original_dtype))
     }
 }
 
@@ -452,9 +401,9 @@ impl<B: Backend> Gemma2ModelLora<B> {
             h = layer.forward(h, Some(mask.clone()));
         }
 
-        // Final norm + LM head in f32 (hidden_size=2304 dot product with 256K vocab).
+        // Final norm (mixed precision for stability) + LM head + softcapping
         let h = rms_norm_f32(&self.norm, h);
-        let logits = linear_f32(&self.lm_head, h);
+        let logits = self.lm_head.forward(h);
 
         // Softcapping in f32 for numerical stability
         let original_dtype = logits.dtype();
@@ -487,9 +436,8 @@ impl<B: Backend> Gemma2ModelLora<B> {
             h = layer.forward(h, Some(mask.clone()));
         }
 
-        // LM head in f32: hidden_size=2304 dot product with 256K vocab overflows f16.
         let h = rms_norm_f32(&self.norm, h);
-        linear_f32(&self.lm_head, h)
+        self.lm_head.forward(h)
     }
 
     /// Forward pass with fused LoRA MLP kernels, returning raw logits without softcapping.
@@ -524,9 +472,8 @@ impl<B: Backend> Gemma2ModelLora<B> {
             h = layer.forward_fused(h, Some(mask.clone()));
         }
 
-        // LM head in f32: hidden_size=2304 dot product with 256K vocab overflows f16.
         let h = rms_norm_f32(&self.norm, h);
-        linear_f32(&self.lm_head, h)
+        self.lm_head.forward(h)
     }
 
     /// Merge all LoRA weights into base layers for inference.
@@ -916,9 +863,7 @@ pub struct Gemma2ForSFT<B: Backend> {
     /// Pad token ID to ignore in cross-entropy loss.
     pub pad_token_id: usize,
     /// If true, use fused CE kernel with inline softcapping instead of standard CE.
-    /// Recommended for f16 Metal: avoids 256K log_probs materialization (~4GB saved),
-    /// f32 upcast in fused kernel prevents NaN from f16 logsumexp overflow.
-    /// Standard CE is ~20% faster but materializes [N, 256K] log_probs in f32 (~8GB).
+    /// Default: false (standard CE is faster; fused CE saves memory but is slower).
     pub use_fused_ce: bool,
 }
 
@@ -980,9 +925,7 @@ fn mask_normalize_ce<B: Backend>(
     let [batch_size, seq_len] = token_losses.dims();
     let device = token_losses.device();
     let original_dtype = token_losses.dtype();
-
     let masked_ce = token_losses.mask_fill(mask_pad.clone(), 0);
-
     // Upcast sum accumulation to f32 for precision (same pattern as rms_norm_f32).
     // Both operands cast to f32 before sum+division avoids DTypeMismatch in autodiff.
     let masked_ce_sum = masked_ce.cast(FloatDType::F32).sum();
@@ -990,46 +933,19 @@ fn mask_normalize_ce<B: Backend>(
         .mask_fill(mask_pad, 0)
         .cast(FloatDType::F32)
         .sum();
-
     (masked_ce_sum / ntokens).cast(original_dtype)
-}
-
-/// Same as `mask_normalize_ce` but keeps the result in f32.
-///
-/// Critical for f16 training: calling `loss.backward()` on an f32 loss
-/// keeps the entire backward chain in f32, preventing gradient overflow
-/// when propagating through 26 transformer layers. The weight gradients
-/// are cast to f16 only at the final cast operation in `linear_f32`,
-/// and Adam's `mixed_precision` mode casts them back to f32 for the update.
-fn mask_normalize_ce_f32<B: Backend>(
-    token_losses: Tensor<B, 2>,
-    mask_pad: Tensor<B, 2, burn::tensor::Bool>,
-) -> Tensor<B, 1> {
-    let [batch_size, seq_len] = token_losses.dims();
-    let device = token_losses.device();
-
-    let masked_ce = token_losses.mask_fill(mask_pad.clone(), 0);
-
-    let masked_ce_sum = masked_ce.cast(FloatDType::F32).sum();
-    let ntokens = Tensor::<B, 2>::ones([batch_size, seq_len], &device)
-        .mask_fill(mask_pad, 0)
-        .cast(FloatDType::F32)
-        .sum();
-
-    masked_ce_sum / ntokens
 }
 
 /// TrainStep for cubecl GPU backends (metal, wgpu, cuda, vulkan, rocm).
 ///
 /// Supports two CE paths selected at runtime via `use_fused_ce`:
-/// - `true` (recommended for f16): Fused CE with inline softcapping (single GPU kernel).
+/// - `false` (default): Standard CE (log_softmax → gather → neg).
+///   Faster (~0.20s/iter) — burn's `log_softmax` handles f16 numerical stability.
+///   Materializes `[batch*seq, 256K]` log_probs (~4GB for seq=2048).
+/// - `true`: Fused CE with inline softcapping (single GPU kernel).
 ///   Avoids materializing `[batch*seq, 256K]` log_probs (~4GB memory saved).
-///   f32 upcast in fused kernel prevents NaN from f16 logsumexp overflow.
-///   ~20% slower than standard CE but numerically safer for f16.
-/// - `false`: Standard CE (log_softmax → gather → neg).
-///   Faster (~0.20s/iter) — materializes `[batch*seq, 256K]` log_probs in f32.
-///   Logits are upcast to f32 before log_softmax to prevent 256K-vocab overflow.
-///   Memory-intensive: ~8GB for seq=2048 with 256K vocab.
+///   Slower (~0.25s/iter) — f32 upcast in fused kernel adds overhead.
+///   Use when memory-constrained, not for speed.
 ///
 /// NOTE: Requires `B: FusedCEBackend` — the caller's `run()` function must
 /// propagate this bound. See `sft-train.rs` for the matching cfg-conditional bounds.
@@ -1071,8 +987,7 @@ where
                 crate::fused_ops::fused_ce_loss::<B>(logits_flat, targets_flat, softcap)
                     .reshape([batch_size, seq_len]);
 
-            // Keep loss in f32 for backward — prevents gradient overflow through 26 layers.
-            let loss = mask_normalize_ce_f32(token_losses, mask_pad);
+            let loss = mask_normalize_ce(token_losses, mask_pad);
 
             // NOTE: Do NOT call loss.into_scalar() — GPU sync costs ~800ms/iter.
             TrainOutput::new(
@@ -1082,25 +997,19 @@ where
             )
         } else {
             // Standard CE path: log_softmax → gather → neg (default, faster).
-            // Cast to f32 before log_softmax — f16 overflows with 256K vocab
-            // (exp(30) ≈ 1e13 >> f16 max 65504, causes inf→NaN cascade).
-            // Materializes [batch*seq, 256K] log_probs in f32 (~8GB for seq=2048) but
+            // burn's log_softmax handles f16 numerical stability internally.
+            // Materializes [batch*seq, 256K] log_probs (~4GB for seq=2048) but
             // ~20% faster than fused CE with f32 upcast.
             let logits = self.model.forward(batch.tokens_inputs);
             let [batch_size, seq_len, _vocab_size] = logits.dims();
 
-            let logits_f32 = logits.clone().cast(FloatDType::F32);
             let target_indices = targets.clone().reshape([batch_size, seq_len, 1]);
-
-            let log_probs = log_softmax(logits_f32, 2);
-
-            let token_losses = log_probs
+            let token_losses = log_softmax(logits.clone(), 2)
                 .gather(2, target_indices)
                 .reshape([batch_size, seq_len])
                 .neg();
 
-            // Keep loss in f32 for backward — prevents gradient overflow through 26 layers.
-            let loss = mask_normalize_ce_f32(token_losses, mask_pad);
+            let loss = mask_normalize_ce(token_losses, mask_pad);
 
             TrainOutput::new(
                 self,
@@ -1138,8 +1047,7 @@ impl<B: AutodiffBackend> TrainStep for Gemma2ForSFT<B> {
             .reshape([batch_size, seq_len])
             .neg();
 
-        // Keep loss in f32 for backward — prevents gradient overflow through 26 layers.
-        let loss = mask_normalize_ce_f32(token_losses, batch.mask_pad.clone());
+        let loss = mask_normalize_ce(token_losses, batch.mask_pad.clone());
 
         TrainOutput::new(
             self,
@@ -1157,19 +1065,19 @@ impl<B: Backend> InferenceStep for Gemma2ForSFT<B> {
         let logits = self.model.forward(batch.tokens_inputs);
         let targets = batch.targets;
 
-        // Token-normalized cross-entropy (same formula as TrainStep).
-        // Cast to f32 before log_softmax — f16 overflows with 256K vocab
-        // (exp(30) ≈ 1e13 >> f16 max 65504, causes inf→NaN cascade).
+        // Token-normalized cross-entropy (same formula as TrainStep)
         let [batch_size, seq_len, _vocab_size] = logits.dims();
-        let logits_f32 = logits.clone().cast(FloatDType::F32);
+        let log_probs = log_softmax(logits.clone(), 2);
         let target_indices = targets.clone().reshape([batch_size, seq_len, 1]);
-        let token_losses = log_softmax(logits_f32, 2)
+        let token_log_probs = log_probs
             .gather(2, target_indices)
-            .reshape([batch_size, seq_len])
-            .neg();
+            .reshape([batch_size, seq_len]);
 
-        // Reuse mask_normalize_ce for DRY — handles f32 upcast for sum/normalization.
-        let loss = mask_normalize_ce(token_losses, batch.mask_pad.clone());
+        let masked_ce = token_log_probs.neg().mask_fill(batch.mask_pad.clone(), 0);
+        let ntokens = Tensor::<B, 2>::ones([batch_size, seq_len], &logits.device())
+            .mask_fill(batch.mask_pad, 0)
+            .sum();
+        let loss = masked_ce.sum() / ntokens;
 
         // Log val loss for monitoring
         let loss_val: f32 = loss.clone().into_scalar().elem();

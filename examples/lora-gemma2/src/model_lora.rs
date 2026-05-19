@@ -59,6 +59,24 @@ use crate::model::{Gemma2Attention, Gemma2Block, Gemma2MLP, Gemma2Model};
 use crate::types::LoraTarget;
 
 // ---------------------------------------------------------------------------
+// f32 mixed-precision helper for LM head
+// ---------------------------------------------------------------------------
+
+/// Mixed-precision linear for LM head: cast to f32 for numerically stable matmul.
+///
+/// The LM head matmul (hidden_size=2304 → vocab=256000) produces values and gradients
+/// that overflow f16 max (65504) in both forward and backward passes.
+/// Casting all operands to f32 prevents this with minimal overhead (single layer).
+fn linear_f32<B: Backend, const D: usize>(linear: &Linear<B>, x: Tensor<B, D>) -> Tensor<B, D> {
+    let original_dtype = x.dtype();
+    let x_f32 = x.cast(FloatDType::F32);
+    let w_f32 = linear.weight.val().cast(FloatDType::F32);
+    let b_f32 = linear.bias.as_ref().map(|b| b.val().cast(FloatDType::F32));
+    let out = burn::tensor::module::linear(x_f32, w_f32, b_f32);
+    out.cast(original_dtype)
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -401,9 +419,9 @@ impl<B: Backend> Gemma2ModelLora<B> {
             h = layer.forward(h, Some(mask.clone()));
         }
 
-        // Final norm (mixed precision for stability) + LM head + softcapping
+        // Final norm (mixed precision for stability) + LM head in f32 + softcapping
         let h = rms_norm_f32(&self.norm, h);
-        let logits = self.lm_head.forward(h);
+        let logits = linear_f32(&self.lm_head, h);
 
         // Softcapping in f32 for numerical stability
         let original_dtype = logits.dtype();
@@ -437,7 +455,7 @@ impl<B: Backend> Gemma2ModelLora<B> {
         }
 
         let h = rms_norm_f32(&self.norm, h);
-        self.lm_head.forward(h)
+        linear_f32(&self.lm_head, h)
     }
 
     /// Forward pass with fused LoRA MLP kernels, returning raw logits without softcapping.
@@ -473,7 +491,7 @@ impl<B: Backend> Gemma2ModelLora<B> {
         }
 
         let h = rms_norm_f32(&self.norm, h);
-        self.lm_head.forward(h)
+        linear_f32(&self.lm_head, h)
     }
 
     /// Merge all LoRA weights into base layers for inference.
@@ -924,16 +942,15 @@ fn mask_normalize_ce<B: Backend>(
 ) -> Tensor<B, 1> {
     let [batch_size, seq_len] = token_losses.dims();
     let device = token_losses.device();
-    let original_dtype = token_losses.dtype();
     let masked_ce = token_losses.mask_fill(mask_pad.clone(), 0);
-    // Upcast sum accumulation to f32 for precision (same pattern as rms_norm_f32).
+    // Keep loss in f32 for backward — prevents gradient overflow through 26 layers.
     // Both operands cast to f32 before sum+division avoids DTypeMismatch in autodiff.
     let masked_ce_sum = masked_ce.cast(FloatDType::F32).sum();
     let ntokens = Tensor::<B, 2>::ones([batch_size, seq_len], &device)
         .mask_fill(mask_pad, 0)
         .cast(FloatDType::F32)
         .sum();
-    (masked_ce_sum / ntokens).cast(original_dtype)
+    masked_ce_sum / ntokens
 }
 
 /// TrainStep for cubecl GPU backends (metal, wgpu, cuda, vulkan, rocm).
@@ -997,14 +1014,14 @@ where
             )
         } else {
             // Standard CE path: log_softmax → gather → neg (default, faster).
-            // burn's log_softmax handles f16 numerical stability internally.
-            // Materializes [batch*seq, 256K] log_probs (~4GB for seq=2048) but
-            // ~20% faster than fused CE with f32 upcast.
+            // Cast logits to f32 before log_softmax: softcapped logits up to 30.0
+            // cause exp(30) ≈ 1e13 which overflows f16 max (65504) → inf loss.
             let logits = self.model.forward(batch.tokens_inputs);
             let [batch_size, seq_len, _vocab_size] = logits.dims();
 
+            let logits_f32 = logits.clone().cast(FloatDType::F32);
             let target_indices = targets.clone().reshape([batch_size, seq_len, 1]);
-            let token_losses = log_softmax(logits.clone(), 2)
+            let token_losses = log_softmax(logits_f32, 2)
                 .gather(2, target_indices)
                 .reshape([batch_size, seq_len])
                 .neg();

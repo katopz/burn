@@ -61,6 +61,25 @@ fn linear_f32<B: Backend, const D: usize>(linear: &Linear<B>, x: Tensor<B, D>) -
     out.cast(original_dtype)
 }
 
+/// LM-head variant: same as `linear_f32` but does not cast the output back to
+/// the input dtype.
+///
+/// Gemma 2's tied LM head can emit per-token logits outside the f16 range
+/// (max 65504). A roundtrip through f16 before softcap turns those into `inf`,
+/// `tanh(inf/30)*30 == 30` saturates every overflowing token to the same
+/// value, and softmax collapses to uniform — cross-entropy then sticks at
+/// `ln(vocab_size) ≈ 12.45` regardless of input. Keeping the logit chain in
+/// f32 through softcap preserves the per-token differences.
+fn linear_f32_keep<B: Backend, const D: usize>(
+    linear: &Linear<B>,
+    x: Tensor<B, D>,
+) -> Tensor<B, D> {
+    let x_f32 = x.cast(FloatDType::F32);
+    let w_f32 = linear.weight.val().cast(FloatDType::F32);
+    let b_f32 = linear.bias.as_ref().map(|b| b.val().cast(FloatDType::F32));
+    burn::tensor::module::linear(x_f32, w_f32, b_f32)
+}
+
 /// Mixed-precision RMSNorm: upcast input to f32 for numerically stable normalization.
 ///
 /// Computes the full RMSNorm (variance, normalization, gamma scaling) in f32,
@@ -487,16 +506,11 @@ impl<B: Backend> Gemma2Model<B> {
             h = layer.forward(h, Some(mask.clone()));
         }
 
-        // Final norm (mixed precision for stability)
+        // Final norm + LM head + softcap, all in f32 (see `linear_f32_keep`).
+        let original_dtype = h.dtype();
         let h = rms_norm_f32(&self.norm, h);
-
-        // LM head in f32: hidden_size=2304 dot product with 256K vocab overflows f16.
-        let logits = linear_f32(&self.lm_head, h);
-
-        // Final logit softcapping in f32: tanh(logits / cap) * cap
-        let original_dtype = logits.dtype();
-        logits
-            .cast(FloatDType::F32)
+        let logits_f32 = linear_f32_keep(&self.lm_head, h);
+        logits_f32
             .div_scalar(self.final_logit_softcapping)
             .tanh()
             .mul_scalar(self.final_logit_softcapping)
@@ -528,12 +542,9 @@ impl<B: Backend> Gemma2Model<B> {
 
     /// Compute logits from hidden states (after LM head + softcapping in f32).
     pub fn hidden_to_logits(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
-        // LM head in f32: hidden_size=2304 dot product with 256K vocab overflows f16.
-        let logits = linear_f32(&self.lm_head, hidden);
-        // Softcapping in f32 for numerical stability
-        let original_dtype = logits.dtype();
-        logits
-            .cast(FloatDType::F32)
+        let original_dtype = hidden.dtype();
+        let logits_f32 = linear_f32_keep(&self.lm_head, hidden);
+        logits_f32
             .div_scalar(self.final_logit_softcapping)
             .tanh()
             .mul_scalar(self.final_logit_softcapping)
@@ -571,17 +582,15 @@ impl<B: Backend> Gemma2Model<B> {
         }
 
         // Final norm
+        let original_dtype = h.dtype();
         let h = rms_norm_f32(&self.norm, h);
         checks.push(check_tensor(&h, "final_norm"));
 
-        // LM head in f32: hidden_size=2304 dot product with 256K vocab overflows f16.
-        let logits = linear_f32(&self.lm_head, h);
-        checks.push(check_tensor(&logits, "lm_head"));
+        // LM head + softcap in f32 (see `linear_f32_keep`).
+        let logits_f32 = linear_f32_keep(&self.lm_head, h);
+        checks.push(check_tensor(&logits_f32, "lm_head"));
 
-        // Final logit softcapping in f32: tanh(logits / cap) * cap
-        let original_dtype = logits.dtype();
-        let capped = logits
-            .cast(FloatDType::F32)
+        let capped = logits_f32
             .div_scalar(self.final_logit_softcapping)
             .tanh()
             .mul_scalar(self.final_logit_softcapping)

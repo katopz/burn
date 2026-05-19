@@ -66,18 +66,26 @@ use crate::types::LoraTarget;
 // operands (input, weight, LoRA A/B) to f32 before matmul to prevent both
 // overflow and dtype mismatch in the autodiff backward pass.
 
-/// Mixed-precision plain linear: cast input, weight, and bias to f32.
-/// Used for `lm_head` (Linear, not LoRA-adapted).
+/// LM-head linear: cast input, weight, and bias to f32 for the matmul and
+/// keep the result in f32.
 ///
-/// Casts the output back to original dtype so downstream residual connections
-/// see a uniform dtype.
-fn linear_f32<B: Backend, const D: usize>(linear: &Linear<B>, x: Tensor<B, D>) -> Tensor<B, D> {
-    let original_dtype = x.dtype();
+/// Why this exists: Gemma 2's tied LM head can produce per-token logits
+/// outside the f16 range (max 65504). The roundtrip `f32 → f16 → f32` in
+/// `linear_f32` overflows those logits to `inf` in f16, and the subsequent
+/// softcap (`tanh(inf/30)*30 = 30`) saturates every overflowing token to
+/// exactly 30. With many tokens saturated, softmax collapses to a uniform
+/// distribution and cross-entropy snaps to `ln(vocab_size) = 12.4529` for
+/// every non-NaN iter — the exact "loss never moves" symptom seen on
+/// Q8F/f16 Metal. Staying in f32 through softcap preserves the inter-token
+/// differences that the model needs to learn from.
+fn linear_f32_keep<B: Backend, const D: usize>(
+    linear: &Linear<B>,
+    x: Tensor<B, D>,
+) -> Tensor<B, D> {
     let x_f32 = x.cast(FloatDType::F32);
     let w_f32 = linear.weight.val().cast(FloatDType::F32);
     let b_f32 = linear.bias.as_ref().map(|b| b.val().cast(FloatDType::F32));
-    let out = burn::tensor::module::linear(x_f32, w_f32, b_f32);
-    out.cast(original_dtype)
+    burn::tensor::module::linear(x_f32, w_f32, b_f32)
 }
 
 /// Mixed-precision LoRA linear: cast input, base weight, and LoRA A/B to f32
@@ -476,14 +484,15 @@ impl<B: Backend> Gemma2ModelLora<B> {
             h = layer.forward(h, Some(mask.clone()));
         }
 
-        // Final norm + LM head in f32 + softcapping
+        // Final norm + LM head + softcapping, all in f32.
+        // The LM head logits can exceed f16 range on Gemma 2 (the architecture
+        // uses softcap precisely because raw logits are large); going through
+        // f16 anywhere in the chain risks an `inf → tanh → 30` saturation that
+        // collapses softmax to uniform.
+        let original_dtype = h.dtype();
         let h = rms_norm_f32(&self.norm, h);
-        let logits = linear_f32(&self.lm_head, h);
-
-        // Softcapping in f32 for numerical stability
-        let original_dtype = logits.dtype();
-        logits
-            .cast(FloatDType::F32)
+        let logits_f32 = linear_f32_keep(&self.lm_head, h);
+        logits_f32
             .div_scalar(self.final_logit_softcapping)
             .tanh()
             .mul_scalar(self.final_logit_softcapping)
@@ -511,8 +520,12 @@ impl<B: Backend> Gemma2ModelLora<B> {
             h = layer.forward(h, Some(mask.clone()));
         }
 
+        // Keep logits in f32 for the fused-CE path. Casting back to f16 here
+        // would overflow large Gemma 2 logits to inf before the fused CE
+        // kernel applies softcap, which then saturates everything to 30 and
+        // produces uniform softmax / loss = ln(vocab) regardless of input.
         let h = rms_norm_f32(&self.norm, h);
-        linear_f32(&self.lm_head, h)
+        linear_f32_keep(&self.lm_head, h)
     }
 
     /// Forward pass with fused LoRA MLP kernels, returning raw logits without softcapping.
@@ -547,8 +560,10 @@ impl<B: Backend> Gemma2ModelLora<B> {
             h = layer.forward_fused(h, Some(mask.clone()));
         }
 
+        // Same f32 logit invariant as `forward_raw` — fused CE kernel applies
+        // softcap itself, and reads logits as f32 to avoid f16 overflow.
         let h = rms_norm_f32(&self.norm, h);
-        linear_f32(&self.lm_head, h)
+        linear_f32_keep(&self.lm_head, h)
     }
 
     /// Merge all LoRA weights into base layers for inference.

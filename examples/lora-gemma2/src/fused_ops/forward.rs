@@ -182,12 +182,18 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> FusedLoraM
         let down_w_t = Self::float_transpose(down_w);
 
         // Step 1: Down projection backward → dh
-        // dh = dy @ W^T + dy @ Bw^T @ Aw^T * sw
+        // dh = dy @ W^T + (dy @ Bw^T) @ Aw^T * sw
+        //
+        // `dy_bwt = dy @ Bw^T` is reused below for `d_down_a`, so compute it
+        // once here instead of dispatching the same matmul twice on GPU.
         let dh_base = Self::float_matmul(dy.clone(), down_w_t);
-        let dy_bwt = Self::float_matmul(dy.clone(), down_b_t.clone());
+        let dy_bwt = Self::float_matmul(dy.clone(), down_b_t);
         let dh = Self::float_add(
             dh_base,
-            Self::float_mul_scalar(Self::float_matmul(dy_bwt, down_a_t.clone()), down_s.into()),
+            Self::float_mul_scalar(
+                Self::float_matmul(dy_bwt.clone(), down_a_t.clone()),
+                down_s.into(),
+            ),
         );
 
         // Step 2: GeGLU backward → (h, dg, de)
@@ -196,9 +202,15 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> FusedLoraM
         // Step 3: LoRA weight gradients
         let h_t = Self::float_transpose(h);
 
-        // Down LoRA: dAw = h^T @ (dy @ Bw^T) * sw, dBw = (Aw^T @ h^T) @ dy * sw
+        // Precompute the two remaining (intermediate × *_b_t) matmuls reused by both
+        // the LoRA-A weight gradient and the input gradient. Together with `dy_bwt`
+        // above, this drops three redundant GPU matmul dispatches per backward call.
+        let de_bgt = Self::float_matmul(de.clone(), gate_b_t);
+        let dg_but = Self::float_matmul(dg.clone(), up_b_t);
+
+        // Down LoRA: dAw = h^T @ dy_bwt * sw, dBw = (Aw^T @ h^T) @ dy * sw
         let d_down_a = Self::float_mul_scalar(
-            Self::float_matmul(h_t.clone(), Self::float_matmul(dy.clone(), down_b_t)),
+            Self::float_matmul(h_t.clone(), dy_bwt),
             down_s.into(),
         );
         let d_down_b = Self::float_mul_scalar(
@@ -206,9 +218,9 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> FusedLoraM
             down_s.into(),
         );
 
-        // Up LoRA: dAu = X^T @ (dg @ Bu^T) * su, dBu = (Au^T @ X^T) @ dg * su
+        // Up LoRA: dAu = X^T @ dg_but * su, dBu = (Au^T @ X^T) @ dg * su
         let d_up_a = Self::float_mul_scalar(
-            Self::float_matmul(x_t.clone(), Self::float_matmul(dg.clone(), up_b_t.clone())),
+            Self::float_matmul(x_t.clone(), dg_but.clone()),
             up_s.into(),
         );
         let d_up_b = Self::float_mul_scalar(
@@ -216,12 +228,9 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> FusedLoraM
             up_s.into(),
         );
 
-        // Gate LoRA: dAg = X^T @ (de @ Bg^T) * sg, dBg = (Ag^T @ X^T) @ de * sg
+        // Gate LoRA: dAg = X^T @ de_bgt * sg, dBg = (Ag^T @ X^T) @ de * sg
         let d_gate_a = Self::float_mul_scalar(
-            Self::float_matmul(
-                x_t.clone(),
-                Self::float_matmul(de.clone(), gate_b_t.clone()),
-            ),
+            Self::float_matmul(x_t.clone(), de_bgt.clone()),
             gate_s.into(),
         );
         let d_gate_b = Self::float_mul_scalar(
@@ -230,18 +239,18 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> FusedLoraM
         );
 
         // Step 4: Input gradient dX
-        // dX = de @ G^T + de @ Bg^T @ Ag^T * sg + dg @ U^T + dg @ Bu^T @ Au^T * su
+        // dX = de @ G^T + de_bgt @ Ag^T * sg + dg @ U^T + dg_but @ Au^T * su
         let dx_gate = Self::float_add(
-            Self::float_matmul(de.clone(), gate_w_t),
+            Self::float_matmul(de, gate_w_t),
             Self::float_mul_scalar(
-                Self::float_matmul(Self::float_matmul(de, gate_b_t), gate_a_t),
+                Self::float_matmul(de_bgt, gate_a_t),
                 gate_s.into(),
             ),
         );
         let dx_up = Self::float_add(
-            Self::float_matmul(dg.clone(), up_w_t),
+            Self::float_matmul(dg, up_w_t),
             Self::float_mul_scalar(
-                Self::float_matmul(Self::float_matmul(dg, up_b_t), up_a_t),
+                Self::float_matmul(dg_but, up_a_t),
                 up_s.into(),
             ),
         );

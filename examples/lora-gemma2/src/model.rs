@@ -52,7 +52,7 @@ fn causal_mask<B: Backend>(seq_len: usize, device: &B::Device) -> Tensor<B, 2> {
 ///
 /// NOTE: Must cast ALL operands to f32 — burn's matmul dispatch reinterprets rhs
 /// bytes as lhs dtype, so mismatched dtypes (f32 input × f16 weight) produce garbage.
-fn linear_f32<B: Backend, const D: usize>(linear: &Linear<B>, x: Tensor<B, D>) -> Tensor<B, D> {
+pub fn linear_f32<B: Backend, const D: usize>(linear: &Linear<B>, x: Tensor<B, D>) -> Tensor<B, D> {
     let original_dtype = x.dtype();
     let x_f32 = x.cast(FloatDType::F32);
     let w_f32 = linear.weight.val().cast(FloatDType::F32);
